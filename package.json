@@ -1,0 +1,38 @@
+{
+  "name": "pi-jev-router",
+  "version": "0.5.0",
+  "description": "Automatic model routing for Pi using TypeSafe's Jev through Vercel AI Gateway",
+  "license": "MIT",
+  "author": "MejiasDev",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mejiasd3v/pi-jev-router.git"
+  },
+  "keywords": ["pi-package", "pi-extension", "model-routing", "jev"],
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "files": ["index.ts", "README.md", "LICENSE", "assets/logo.png"],
+  "scripts": {
+    "test": "node --test index.test.mjs"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-ai": { "optional": true },
+    "@earendil-works/pi-coding-agent": { "optional": true }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.85.1"
+  },
+  "dependencies": {
+    "ai": "7.0.105",
+    "zod": "4.6.5"
+  }
+}

@@ -14,7 +14,7 @@ const piAi = piRequire.resolve.paths("@earendil-works/pi-ai")
 assert.ok(piAi, "Pi's installed pi-ai package must be available");
 const { createJiti } = piRequire("jiti");
 const jiti = createJiti(import.meta.url, { alias: { "@earendil-works/pi-ai": piAi } });
-const { default: extension, parseConfig, routingInput, effortPayload } = await jiti.import("./index.ts");
+const { default: extension, parseConfig, routingInput, effortPayload } = await jiti.import("../index.ts");
 const { convertToLlm } = await jiti.import("@earendil-works/pi-coding-agent");
 const { createAssistantMessageEventStream } = await import(pathToFileURL(piAi));
 // Never read or write the developer's settings.
@@ -316,7 +316,7 @@ test("skill file failures skip only that skill and cancellation saves no decisio
 });
 
 test("declares the AI SDK's required runtime peers for Pi's peer-disabled npm installs", () => {
-	const manifest = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8"));
+	const manifest = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
 	const sdk = JSON.parse(readFileSync(new URL(import.meta.resolve("ai/package.json")), "utf8"));
 	for (const peer of Object.keys(sdk.peerDependencies ?? {})) {
 		if (sdk.peerDependenciesMeta?.[peer]?.optional) continue;
@@ -532,6 +532,11 @@ test("adaptive effort failure and invalid choices retain current effort without 
 	assert.equal(h.calls[0].payload.input.filter((item) => item.type === "configuration_update").length, 0);
 	assert.doesNotMatch(JSON.stringify(requests[0]), /PRIVATE/);
 	assert.match(h.notices.at(-1)[0], /Keeping the current effort/);
+	const effortTrace = h.entries.filter((entry) => entry.name === "jev-trace" && entry.data.kind === "effort").at(-1);
+	assert.equal(effortTrace.data.outcome, "failed");
+	assert.equal(effortTrace.data.thinking, "high");
+	assert.match(effortTrace.data.reason, /^(budget|missing-key|invalid-choice|payload|timeout|unavailable)$/);
+	assert.doesNotMatch(JSON.stringify(h.entries), /PRIVATE/);
 	const missing = await harness({ refs: [DEEP], responsesPayload: true, history, gatewayKey: false });
 	await missing.stream().result();
 	assert.equal(missing.calls[0].payload.reasoning.effort, "high");
@@ -564,6 +569,100 @@ test("adaptive effort cancellation saves no decision and timeout keeps the exist
 		assert.equal(h.calls[0].payload.reasoning.effort, "medium");
 		assert.match(h.notices.at(-1)[0], /Keeping the current effort/);
 	} finally { clearInterval(keepAlive); }
+});
+
+test("concrete GPT-6 low thinking asks Jev and keeps low when the check fails", async (t) => {
+	t.after(() => rmSync(settingsPath, { force: true }));
+	writeFileSync(settingsPath, JSON.stringify({ jevRouter: { options: {
+		[DEEP]: { description: "Deep", thinking: "auto" },
+		[FAST]: { description: "Fast", thinking: "auto" },
+	}, fallback: DEEP } }));
+	let mode = "high";
+	const requests = mockGateway(t, () => {
+		if (mode === "boom") throw new Error("down");
+		if (mode === "503") return Response.json({ error: "PRIVATE 503" }, { status: 503 });
+		return mode;
+	});
+	const h = await harness({ refs: [FAST, DEEP] });
+	const astra = h.models.find((model) => model.id === "gpt-6-astra");
+	const payload = { input: [{ role: "user", content: "Fix the failure" }], reasoning: { effort: "low", summary: "auto" }, prompt_cache_key: "session" };
+	const ask = async (model, thinkingLevel) => {
+		h.ctx.model = model;
+		h.ctx.thinkingLevel = thinkingLevel;
+		await h.handlers.get("context")({ messages: context("Fix the failure").messages }, h.ctx);
+		return h.handlers.get("before_provider_request")({ payload }, h.ctx);
+	};
+	const updated = await ask(astra, "low");
+	assert.equal(updated.reasoning.effort, "low");
+	assert.equal(updated.reasoning.summary, "auto");
+	assert.equal(updated.prompt_cache_key, "session");
+	assert.deepEqual(updated.input.at(-1), { type: "configuration_update", reasoning: { effort: "high" } });
+	assert.equal(payload.input.length, 1);
+	assert.equal(requests.length, 1);
+	assert.match(h.notices.at(-1)[0], /thinking high \(low switch\)/);
+	const traces = () => h.entries.filter((entry) => entry.name === "jev-trace");
+	assert.deepEqual(traces().at(-1).data, { sessionId: "main", kind: "low-switch", outcome: "applied", target: DEEP, thinking: "high" });
+	await h.commands.get("jev").handler("", h.ctx);
+	assert.match(h.notices.at(-1)[0], /Last trace: low-switch applied high openai-codex\/gpt-6-astra/);
+	mode = "low";
+	assert.equal(await ask(astra, "low"), undefined);
+	assert.equal(requests.length, 2);
+	assert.deepEqual(traces().at(-1).data, { sessionId: "main", kind: "low-switch", outcome: "kept", target: DEEP, thinking: "low" });
+	const quiet = traces().length;
+	assert.equal(await ask(astra, "high"), undefined);
+	assert.equal(await ask(h.models.find((model) => model.id === "gpt-5.6-luna"), "low"), undefined);
+	assert.equal(await ask(h.ctx.modelRegistry.find("auto", "jev"), "low"), undefined);
+	assert.equal(traces().length, quiet);
+	assert.equal(requests.length, 2);
+	mode = "boom";
+	const failed = await ask(astra, "low");
+	assert.equal(failed, undefined);
+	assert.equal(payload.reasoning.effort, "low");
+	assert.match(h.notices.at(-1)[0], /Keeping low/);
+	assert.deepEqual(traces().at(-1).data, { sessionId: "main", kind: "low-switch", outcome: "failed", target: DEEP, thinking: "low", reason: "unavailable" });
+	assert.doesNotMatch(JSON.stringify(traces()), /down/);
+	mode = "high";
+	await ask(astra, "low");
+	mode = "503";
+	const before503 = requests.length;
+	assert.deepEqual((await ask(astra, "low")).input.at(-1), { type: "configuration_update", reasoning: { effort: "high" } });
+	assert.equal(requests.length, before503 + 2, "retry 503 once before reusing the previous effort");
+	assert.deepEqual(traces().at(-1).data, { sessionId: "main", kind: "low-switch", outcome: "failed", target: DEEP, thinking: "high", reason: "unavailable" });
+	assert.match(h.notices.at(-1)[0], /Keeping last effort high/);
+	assert.doesNotMatch(JSON.stringify(traces()), /PRIVATE 503/);
+	mode = "high";
+	let retried = false;
+	const previousFetch = globalThis.fetch;
+	globalThis.fetch = async (...args) => {
+		if (!retried) {
+			retried = true;
+			return Response.json({ error: "PRIVATE TRANSIENT EFFORT" }, { status: 503 });
+		}
+		return previousFetch(...args);
+	};
+	assert.deepEqual((await ask(astra, "low")).input.at(-1), { type: "configuration_update", reasoning: { effort: "high" } });
+	assert.equal(traces().at(-1).data.outcome, "applied");
+	globalThis.fetch = previousFetch;
+	const resumed = await harness({ history: h.entries });
+	resumed.ctx.model = resumed.models.find((model) => model.id === "gpt-6-astra");
+	resumed.ctx.thinkingLevel = "low";
+	await resumed.handlers.get("context")({ messages: context("After reload").messages }, resumed.ctx);
+	mode = "503";
+	assert.deepEqual((await resumed.handlers.get("before_provider_request")({ payload }, resumed.ctx)).input.at(-1),
+		{ type: "configuration_update", reasoning: { effort: "high" } }, "last successful effort survives reload");
+	const other = await harness({ history: h.entries, sessionId: "other" });
+	other.ctx.model = other.models.find((model) => model.id === "gpt-6-astra");
+	other.ctx.thinkingLevel = "low";
+	await other.handlers.get("context")({ messages: context("New session").messages }, other.ctx);
+	assert.equal(await other.handlers.get("before_provider_request")({ payload }, other.ctx), undefined,
+		"another session cannot inherit the previous effort");
+	mode = "high";
+	h.ctx.signal = AbortSignal.abort();
+	const before = h.notices.length;
+	const traced = traces().length;
+	assert.equal(await ask(astra, "low"), undefined);
+	assert.equal(h.notices.length, before);
+	assert.equal(traces().length, traced);
 });
 
 test("effort payload preserves headers/settings, rejects incompatible modes, and maps provider effort names", () => {
@@ -864,7 +963,7 @@ test("failed or cancelled monitoring never suggests a fallback or drops the exis
 	assert.doesNotMatch(JSON.stringify(h.entries), /PRIVATE MONITOR BODY/);
 	const resumed = await harness({ history: h.entries });
 	await resumed.stream(context("Harder task", 3)).result();
-	assert.equal(requests.length, 2, "reload must not repeat a completed check for the same message");
+	assert.equal(requests.length, 3, "reload must not repeat a completed check for the same message");
 	mode = "hanging";
 	const controller = new AbortController();
 	const pending = h.stream(context("Another task", 4), { signal: controller.signal }).result();
@@ -895,20 +994,85 @@ test("only allowlisted available models are offered; Gateway failures never invo
 	const h = await harness();
 	const result = await h.stream().result();
 	assert.equal(result.model, "gpt-6-astra");
-	assert.equal(requests.length, 1, "no SDK retry delays");
+	assert.equal(requests.length, 2, "one immediate retry for a 503 before fallback");
 	assert.equal(h.calls[0].options.reasoning, "xhigh");
 	assert.equal(h.entries[0].data.source, "fallback");
 	assert.doesNotMatch(JSON.stringify(h.notices), /PRIVATE SERVER BODY/);
 	await h.stream().result();
-	assert.equal(requests.length, 1, "fallback is also pinned");
+	assert.equal(requests.length, 2, "fallback is also pinned");
 
 	const single = await harness({ refs: [FAST] });
 	await single.stream().result();
 	assert.equal(single.calls[0].model.id, "gpt-5.6-luna");
-	assert.equal(requests.length, 1, "one candidate needs no evaluator");
+	assert.equal(requests.length, 2, "one candidate needs no evaluator");
 	const none = await harness({ refs: [] });
 	assert.equal((await none.stream().result()).stopReason, "error");
 	assert.equal(none.calls.length, 0);
+});
+
+test("a transient Jev 503 retries once and uses the recovered routing decision", async (t) => {
+	let attempts = 0;
+	const requests = mockGateway(t, () => ++attempts === 1
+		? Response.json({ error: "PRIVATE TRANSIENT BODY" }, { status: 503 }) : FAST);
+	const h = await harness();
+	assert.equal((await h.stream().result()).model, "gpt-5.6-luna");
+	assert.equal(requests.length, 2);
+	assert.equal(h.entries[0].data.source, "jev");
+	assert.equal(h.entries[0].data.evaluationRequests, 2);
+	assert.equal(h.entries[0].data.usageIncomplete, true, "the failed attempt has no reported usage");
+	assert.doesNotMatch(JSON.stringify(h.entries) + JSON.stringify(h.notices), /PRIVATE TRANSIENT BODY/);
+	await h.stream().result();
+	assert.equal(requests.length, 2, "a successful pin needs no reevaluation");
+});
+
+test("a transient 503 during monitoring still evaluates a fork suggestion", async (t) => {
+	let attempts = 0;
+	const requests = mockGateway(t, () => ++attempts === 2
+		? Response.json({ error: "PRIVATE TRANSIENT MONITOR" }, { status: 503 })
+		: attempts === 1 ? FAST : DEEP);
+	const h = await harness();
+	await h.stream().result();
+	assert.equal((await h.stream(context("Harder task", 3)).result()).model, "gpt-5.6-luna");
+	assert.equal(requests.length, 3);
+	assert.equal(h.entries.filter((entry) => entry.name === "jev-suggestion").length, 1);
+	assert.equal(h.entries.findLast((entry) => entry.name === "jev-monitor").data.source, "jev");
+	assert.doesNotMatch(JSON.stringify(h.entries), /PRIVATE TRANSIENT MONITOR/);
+});
+
+test("transient 503 recovers skill selection and adaptive effort without falling back", async (t) => {
+	configureSkills(t);
+	const skill = skillFixture("transient-skill");
+	let skillAttempts = 0;
+	const skillRequests = mockGateway(t, () => ++skillAttempts === 1
+		? Response.json({ error: "PRIVATE TRANSIENT SKILL" }, { status: 503 })
+		: Response.json({ answers: { 0: { type: "boolean", probability: 0.95 } }, usage: { inputTokens: 1000, outputTokens: 0 } }));
+	const skills = await harness({ refs: [FAST] });
+	await setSkills(skills, [skill]);
+	assert.equal((await skillContext(skills, [user("Use transient skill")])).messages.length, 2);
+	assert.equal(skillRequests.length, 2);
+	assert.equal(skills.notices.filter(([, level]) => level === "warning").length, 0);
+
+	writeFileSync(settingsPath, JSON.stringify({ jevRouter: { options: {
+		[DEEP]: { description: "Deep", thinking: "auto", adaptiveThinking: true },
+	}, fallback: DEEP, monitor: false } }));
+	let effortAttempts = 0;
+	const effortRequests = mockGateway(t, () => ++effortAttempts === 1
+		? Response.json({ error: "PRIVATE TRANSIENT EFFORT" }, { status: 503 }) : "high");
+	const history = [{ name: "jev-pin", data: { target: DEEP, thinking: "medium", sessionId: "main" } }];
+	const effort = await harness({ refs: [DEEP], responsesPayload: true, history });
+	await effort.stream().result();
+	assert.equal(effortRequests.length, 2);
+	assert.deepEqual(effort.calls[0].payload.input.at(-1), { type: "configuration_update", reasoning: { effort: "high" } });
+	assert.equal(effort.entries.filter((entry) => entry.name === "jev-trace" && entry.data.kind === "effort").at(-1).data.outcome, "applied");
+	assert.doesNotMatch(JSON.stringify(effort.entries), /PRIVATE TRANSIENT EFFORT/);
+});
+
+test("non-503 Jev errors do not retry", async (t) => {
+	const requests = mockGateway(t, () => Response.json({ error: "PRIVATE BAD GATEWAY" }, { status: 502 }));
+	const h = await harness();
+	assert.equal((await h.stream().result()).model, "gpt-6-astra");
+	assert.equal(requests.length, 1);
+	assert.equal(h.entries[0].data.source, "fallback");
 });
 
 test("missing key, invalid choice, and image-only prompts use the configured fallback", async (t) => {
@@ -1071,7 +1235,7 @@ test("a failed chunk cancels its sibling and never combines a partial result", a
 	});
 	const h = await harness();
 	assert.equal((await h.stream(context("x".repeat(80000))).result()).model, "gpt-6-astra");
-	assert.equal(requests.length, 2);
+	assert.equal(requests.length, 3, "the failed chunk retries once without cancelling its sibling early");
 	assert.equal(siblingAborted, true);
 	assert.equal(h.entries[0].data.source, "fallback");
 	assert.equal(h.entries[0].data.usageIncomplete, true);

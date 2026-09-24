@@ -16,9 +16,9 @@
   "pi": {
     "extensions": ["./index.ts"]
   },
-  "files": ["index.ts", "README.md", "LICENSE", "assets/logo.png"],
+  "files": ["index.ts", "README.md", "LICENSE", "assets/logo.png", "docs/guide.zh-CN.md"],
   "scripts": {
-    "test": "node --test index.test.mjs"
+    "test": "node --test tests/index.test.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

@@ -22,6 +22,8 @@ pi install npm:pi-jev-router
 
 Git also works: `pi install git:github.com/mejiasd3v/pi-jev-router`. Keep only one installation.
 
+For local installation and GPT-6 Thinking-menu examples, see the [中文使用手册](docs/guide.zh-CN.md). The [adaptive GPT-6 fork notes](https://github.com/mejiasd3v/pi-jev-router/blob/main/docs/archive/adaptive-gpt6-fork.md) are historical experiment records, not current installation instructions.
+
 1. Use `/login` for your generation provider and `/login vercel-ai-gateway` for Jev. `AI_GATEWAY_API_KEY` also works.
 2. Run `/reload`, then `/model auto/jev`.
 3. Start with your actual task. `/jev` shows the pin, selected effort, and fork suggestions.
@@ -123,10 +125,12 @@ Tasks over **192,000 UTF-8 bytes**, excessive chunk plans, or incomplete evaluat
 
 - **Pin once.** The model and initial effort survive tool calls, compaction, `/reload`, and `/resume`. Effort remains fixed unless adaptive Astra effort is enabled. `/new`, `/fork`, and `/clone` choose afresh. Model and initial-effort configuration changes don't rewrite existing pins.
 - **Suggest, never switch.** Monitoring checks new user text and may suggest a fork with another model, once per alternative per session. Use `/fork`, then `/model` and `/thinking` in the fork to follow it. No automatic forks or model switches.
-- **Control overhead.** Routing and model-monitor evaluation timeouts retry up to three attempts of `timeoutMs` each (1 to 60,000 ms). The entire operation shares a ceiling of **3 × `timeoutMs`**, including chunks and combination: 15 seconds by default. Set `"monitor": false` to disable model-switch advisory checks; tool continuations don't trigger those checks. Adaptive effort has its own per-request check described above.
+- **Control overhead.** A Jev HTTP 503 gets one immediate retry within the same timeout; if it fails again, the normal fallback/keep-current behavior applies. Routing and model-monitor evaluation timeouts retry up to three attempts of `timeoutMs` each (1 to 60,000 ms). The entire operation shares a ceiling of **3 × `timeoutMs`**, including chunks and combination: 15 seconds by default. Skill and effort checks also retry 503 once but do not retry timeouts. Set `"monitor": false` to disable model-switch advisory checks; tool continuations don't trigger those checks. Adaptive effort has its own per-request check described above.
 - **Fail explicitly.** Initial routing failures use the fallback, with its fixed/inherited effort or highest supported automatic choice. If an existing pin becomes unavailable or cannot accept the input, the router errors instead of switching.
 
-Context limits follow the pinned backend. The status and `/jev` show its current effort; Pi's thinking picker does not track automatic choices. Selecting a concrete model bypasses model routing, but not opt-in skill selection. Deferred/background generation is unsupported by `auto/jev`.
+Context limits follow the pinned backend. The status and `/jev` show its current effort; Pi's thinking picker does not track automatic choices. Selecting a concrete model bypasses model routing, but not opt-in skill selection. On `gpt-6-astra`, `gpt-6-luna`, and `gpt-6-sol`, the thinking menu's `low` entry asks Jev for that request's effort. The menu label stays `low`. If the check fails or times out, it reuses the last successfully chosen effort for that model in this session (including after reload); without a usable prior choice, it sends `low` unchanged. Other levels stay fixed. `auto/jev` still treats `low` as a real effort it may choose. Deferred/background generation is unsupported by `auto/jev`.
+
+Route, monitor, effort, and low-switch decisions are also appended as `jev-trace` session entries. `/jev` shows the latest one. Reasons are short labels such as `budget`, `missing-key`, `invalid-choice`, `payload`, `timeout`, or `unavailable`; evaluation error bodies are not stored. These entries are an audit log and are not replayed into later requests.
 
 ## Privacy and cost
 

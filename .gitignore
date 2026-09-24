@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Tooling artifacts
+.playwright-cli/
+*.log
+coverage/
+
+# Build output
+dist/

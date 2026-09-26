@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createRequire } from "node:module";
 import { join } from "node:path";
@@ -14,7 +14,8 @@ const piAi = piRequire.resolve.paths("@earendil-works/pi-ai")
 assert.ok(piAi, "Pi's installed pi-ai package must be available");
 const { createJiti } = piRequire("jiti");
 const jiti = createJiti(import.meta.url, { alias: { "@earendil-works/pi-ai": piAi } });
-const { default: extension, parseConfig, routingInput, effortPayload } = await jiti.import("../index.ts");
+const { default: extension, parseConfig, routingInput, effortPayload, choiceProbability } = await jiti.import("../index.ts");
+const { appendStat, usageFields } = await jiti.import("../ledger.ts");
 const { convertToLlm } = await jiti.import("@earendil-works/pi-coding-agent");
 const { createAssistantMessageEventStream } = await import(pathToFileURL(piAi));
 // Never read or write the developer's settings.
@@ -350,7 +351,7 @@ test("pins the session, forwards tools/auth/hooks/usage, and preserves actual mo
 	assert.deepEqual(Object.values(requests[0].questions.route.criteria).map(({ model, thinking }) => [model, thinking]), [[FAST, "max"], [DEEP, "xhigh"]]);
 	assert.doesNotMatch(JSON.stringify(requests), /PRIVATE|codex-test-key|router-secret/);
 	assert.equal(h.entries[0].data.inputTokens, 1000);
-	assert.equal(h.entries[0].data.estimatedCost, 0.000042);
+	assert.equal(h.entries[0].data.estimatedCost, undefined);
 
 	await h.stream({ ...input, messages: [...input.messages, first.message] }).result();
 	assert.equal(requests.length, 1, "tool continuation must keep its route");
@@ -663,6 +664,57 @@ test("concrete GPT-6 low thinking asks Jev and keeps low when the check fails", 
 	assert.equal(await ask(astra, "low"), undefined);
 	assert.equal(h.notices.length, before);
 	assert.equal(traces().length, traced);
+});
+
+test("luna and sol low switch starts at medium, including when the check fails", async (t) => {
+	t.after(() => rmSync(settingsPath, { force: true }));
+	const LUNA = "openai/gpt-6-luna";
+	const SOL = "openai/gpt-6-sol";
+	writeFileSync(settingsPath, JSON.stringify({ jevRouter: { options: {
+		[LUNA]: { description: "Luna", thinking: "auto", minThinking: "medium" },
+		[SOL]: { description: "Sol", thinking: "auto", minThinking: "medium" },
+		[DEEP]: { description: "Deep", thinking: "auto" },
+	}, fallback: SOL } }));
+	let mode = "high";
+	const requests = mockGateway(t, () => {
+		if (mode === "boom") throw new Error("down");
+		return mode;
+	});
+	const h = await harness({ refs: [LUNA, SOL, DEEP] });
+	const luna = h.models.find((model) => model.id === "gpt-6-luna");
+	const sol = h.models.find((model) => model.id === "gpt-6-sol");
+	const astra = h.models.find((model) => model.id === "gpt-6-astra");
+	const payload = { input: [{ role: "user", content: "Fix the failure" }], reasoning: { effort: "low", summary: "auto" }, prompt_cache_key: "session" };
+	const ask = async (model) => {
+		h.ctx.model = model;
+		h.ctx.thinkingLevel = "low";
+		await h.handlers.get("context")({ messages: context("Fix the failure").messages }, h.ctx);
+		return h.handlers.get("before_provider_request")({ payload }, h.ctx);
+	};
+	const traces = () => h.entries.filter((entry) => entry.name === "jev-trace");
+	const raised = await ask(luna);
+	assert.equal(raised.reasoning.effort, "low");
+	assert.deepEqual(raised.input.at(-1), { type: "configuration_update", reasoning: { effort: "high" } });
+	assert.deepEqual(Object.keys(requests.at(-1).questions.effort.criteria), ["medium", "high", "xhigh", "max"]);
+	assert.match(requests.at(-1).questions.effort.instructions, /Use medium for routine/);
+	mode = "medium";
+	assert.deepEqual((await ask(sol)).input.at(-1), { type: "configuration_update", reasoning: { effort: "medium" } });
+	assert.deepEqual(traces().at(-1).data, { sessionId: "main", kind: "low-switch", outcome: "applied", target: SOL, thinking: "medium" });
+	h.entries.push({ name: "jev-trace", data: { sessionId: "main", kind: "low-switch", outcome: "kept", target: LUNA, thinking: "low" } });
+	mode = "low";
+	const belowFloor = await ask(luna);
+	assert.equal(belowFloor.reasoning.effort, "low");
+	assert.deepEqual(belowFloor.input.at(-1), { type: "configuration_update", reasoning: { effort: "medium" } });
+	assert.deepEqual(traces().at(-1).data, { sessionId: "main", kind: "low-switch", outcome: "failed", target: LUNA, thinking: "medium", reason: "unavailable" });
+	assert.match(h.notices.at(-1)[0], /Keeping minimum medium/);
+	h.entries.push({ name: "jev-trace", data: { sessionId: "main", kind: "low-switch", outcome: "applied", target: LUNA, thinking: "high" } });
+	mode = "boom";
+	assert.deepEqual((await ask(luna)).input.at(-1), { type: "configuration_update", reasoning: { effort: "high" } });
+	assert.match(h.notices.at(-1)[0], /Keeping last effort high/);
+	mode = "low";
+	assert.equal(await ask(astra), undefined);
+	assert.match(requests.at(-1).questions.effort.instructions, /Use low for routine/);
+	assert.equal(traces().at(-1).data.thinking, "low");
 });
 
 test("effort payload preserves headers/settings, rejects incompatible modes, and maps provider effort names", () => {
@@ -1416,6 +1468,108 @@ test("invalid global settings fail instead of using other routes or exposing JSO
 	});
 });
 
+const ledgerPath = (id) => join(agentDir, "jev-router", "sessions", `${id}.jsonl`);
+const ledger = (id) => readFileSync(ledgerPath(id), "utf8").trim().split("\n").map(JSON.parse);
+
+test("private metadata ledger excludes conversation and distinguishes single from paid model evaluation", async () => {
+	const id = "stat-single";
+	const h = await harness({ refs: [FAST], sessionId: id });
+	assert.equal((await h.stream(context("PRIVATE PROMPT" )).result()).model, "gpt-5.6-luna");
+	const records = ledger(id);
+	assert.equal(records.filter((r) => r.kind === "evaluation").length, 1);
+	assert.deepEqual(records.filter((r) => r.kind === "evaluation").map(({ outcome, attempts }) => [outcome, attempts]), [["skipped-single", 0]]);
+	assert.equal(records.find((r) => r.outcome === "skipped-single").probabilities, undefined);
+	assert.equal(records.find((r) => r.outcome === "skipped-single").probabilityStatus, undefined);
+	assert.equal(records.find((r) => r.question === "model" && r.kind === "applied").source, "single");
+	assert.equal(records.find((r) => r.question === "effort" && r.kind === "applied").thinking, "max");
+	assert.ok(!readFileSync(ledgerPath(id), "utf8").includes("PRIVATE PROMPT"));
+	assert.equal(statSync(ledgerPath(id)).mode & 0o777, 0o600);
+	assert.equal(statSync(join(agentDir, "jev-router", "sessions")).mode & 0o777, 0o700);
+});
+
+test("model attempts, retries, failures and missing usage remain separate from applied fallback", async (t) => {
+	let calls = 0;
+	mockGateway(t, () => ++calls === 1 ? new Response("PRIVATE GATEWAY BODY", { status: 503 }) : FAST);
+	const recovered = await harness({ sessionId: "stat-retry" });
+	await recovered.stream(context("PRIVATE PROMPT")).result();
+	const evals = ledger("stat-retry").filter((r) => r.kind === "evaluation");
+	assert.equal(evals.length, 1);
+	assert.equal(evals[0].attempts, 2);
+	assert.equal(evals[0].outcome, "selected");
+	assert.equal(evals[0].inputTokens, 1000);
+	assert.equal(evals[0].outputTokens, 0);
+	assert.ok(!("gatewayCostUsd" in evals[0]));
+	assert.ok(!readFileSync(ledgerPath("stat-retry"), "utf8").includes("PRIVATE"));
+});
+
+test("Gateway-reported zero fee is preserved rather than inferred from tokens", async (t) => {
+	mockGateway(t, (_options, body) => {
+		const choice = Object.entries(body.questions.route.criteria).find(([, profile]) => profile.model === FAST)[0];
+		return Response.json({ answers: { route: { type: "choice", choice } }, usage: { inputTokens: 12, outputTokens: 2 }, providerMetadata: { gateway: { cost: "0" } } });
+	});
+	const id = "stat-zero-fee";
+	await (await harness({ sessionId: id })).stream().result();
+	const item = ledger(id).find((record) => record.kind === "evaluation");
+	assert.equal(item.gatewayCostUsd, 0);
+	assert.equal(item.inputTokens, 12);
+	assert.equal(item.outputTokens, 2);
+});
+
+test("unavailable evaluation and fallback do not count as a successful choice", async (t) => {
+	mockGateway(t, () => new Response("PRIVATE GATEWAY BODY", { status: 401 }));
+	const h = await harness({ sessionId: "stat-fallback" });
+	await h.stream().result();
+	const records = ledger("stat-fallback");
+	assert.equal(records.filter((r) => r.kind === "evaluation").length, 1);
+	assert.equal(records.find((r) => r.kind === "evaluation").reason, "credential");
+	assert.equal(records.find((r) => r.kind === "evaluation").attempts, 1);
+	assert.ok(!("inputTokens" in records.find((r) => r.kind === "evaluation")));
+	assert.equal(records.find((r) => r.kind === "applied" && r.question === "model").outcome, "fallback");
+	assert.equal(records.find((r) => r.kind === "applied" && r.question === "effort").outcome, "fallback");
+	assert.ok(!JSON.stringify(records).includes("PRIVATE"));
+});
+
+test("concrete effort records actual selected and degraded strengths without inflating Jev successes", async (t) => {
+	writeFileSync(settingsPath, JSON.stringify({ jevRouter: { options: { [DEEP]: { description: "Deep", thinking: "auto" } }, fallback: DEEP } }));
+	t.after(() => rmSync(settingsPath, { force: true }));
+	let mode = "high";
+	mockGateway(t, () => mode === "error" ? new Response("PRIVATE RESPONSE", { status: 503 }) : mode);
+	const id = "stat-effort";
+	const h = await harness({ refs: [DEEP], sessionId: id });
+	const model = h.models[0];
+	h.ctx.model = model;
+	h.ctx.thinkingLevel = "low";
+	await h.handlers.get("context")({ messages: context("PRIVATE TEXT").messages }, h.ctx);
+	const payload = { input: [], reasoning: { effort: "low" } };
+	const run = () => h.handlers.get("before_provider_request")({ payload }, h.ctx);
+	assert.equal((await run()).input.at(-1).reasoning.effort, "high");
+	mode = "error";
+	assert.equal((await run()).input.at(-1).reasoning.effort, "high");
+	const evals = ledger(id).filter((r) => r.kind === "evaluation");
+	assert.deepEqual(evals.map(({ outcome, attempts }) => [outcome, attempts]), [["selected", 1], ["temporary-failure", 2]]);
+	assert.deepEqual(ledger(id).filter((r) => r.kind === "applied").map(({ outcome, thinking, source }) => [outcome, thinking, source]), [["selected", "high", "low-switch"], ["fallback", "high", "previous"]]);
+	assert.ok(!readFileSync(ledgerPath(id), "utf8").includes("PRIVATE"));
+});
+
+test("failed ledger writes never interrupt selection or downstream generation", async () => {
+	const blocker = join(agentDir, "jev-router", "sessions");
+	rmSync(blocker, { recursive: true, force: true });
+	writeFileSync(blocker, "not a directory");
+	try {
+		assert.equal(appendStat(agentDir, "blocked", { kind: "evaluation", question: "model", outcome: "failed" }), false);
+		const h = await harness({ refs: [FAST], sessionId: "stat-write-fail" });
+		assert.equal((await h.stream().result()).model, "gpt-5.6-luna");
+		assert.ok(h.notices.some(([text]) => text.includes("could not be saved")));
+	} finally { rmSync(blocker, { force: true }); mkdirSync(blocker); }
+	const privateTarget = join(agentDir, "private-target");
+	writeFileSync(privateTarget, "untouched");
+	symlinkSync(privateTarget, ledgerPath("stat-link"));
+	assert.equal(appendStat(agentDir, "stat-link", { kind: "evaluation", question: "model", outcome: "selected" }), false);
+	assert.equal(readFileSync(privateTarget, "utf8"), "untouched");
+	assert.equal(appendStat(agentDir, "../escape", { kind: "evaluation", question: "model", outcome: "selected" }), false);
+	assert.deepEqual(usageFields({ usage: { inputTokens: 0, outputTokens: undefined }, providerMetadata: { gateway: { cost: "0" } } }), { inputTokens: 0, gatewayCostUsd: 0 });
+});
+
 test("validates config and bounds routing text without sending thinking, tools, images or the system prompt", () => {
 	for (const config of [null, {}, { options: {}, fallback: FAST }, { options: { "auto/jev": { description: "loop" } }, fallback: "auto/jev" }, { options: { [FAST]: { description: "fast", thinking: "nonsense" } }, fallback: FAST }]) {
 		assert.throws(() => parseConfig(config));
@@ -1438,4 +1592,222 @@ test("validates config and bounds routing text without sending thinking, tools, 
 	assert.deepEqual(routingInput(rich).messages, [{ role: "assistant", text: "Previous answer" }, { role: "user", text: "Fix a typo" }]);
 	assert.equal(routingInput(context("x".repeat(16001))).messages[0].text.length, 16001);
 	assert.match(routingInput(context("x".repeat(192001))).reason, /routing limit/);
+});
+
+test("choice probability checks match the SDK rounding allowance and do not normalize", () => {
+	const keys = ["low", "high"];
+	const available = choiceProbability({ low: 0.6, high: 0.4 }, keys);
+	assert.equal(available.probabilityStatus, "available");
+	assert.deepEqual(available.probabilities, { low: 0.6, high: 0.4 });
+	const rounded = choiceProbability({ low: 0.6, high: 0.39 }, keys, 2);
+	assert.equal(rounded.probabilityStatus, "available");
+	assert.equal(rounded.probabilities.high, 0.39);
+	assert.equal(choiceProbability({ low: 0.6, high: 0.39 }, keys).probabilityStatus, "invalid");
+	assert.equal(choiceProbability({ a: 0.33, b: 0.33, c: 0.33 }, ["a", "b", "c"], 2).probabilityStatus, "available");
+	assert.equal(choiceProbability({ low: 0, high: 0 }, keys).probabilityStatus, "invalid");
+	assert.equal(choiceProbability({ low: 0, high: 0 }, keys, 0).probabilityStatus, "available");
+	assert.equal(choiceProbability({ low: 0.2, high: 0.2 }, keys, 2).probabilityStatus, "invalid");
+	assert.deepEqual(choiceProbability(undefined, keys), { probabilityStatus: "missing" });
+	for (const raw of [null, { low: "0.6", high: 0.4 }, { low: -0.1, high: 1.1 }, { low: 0.6 }, { low: 0.6, high: 0.4, secret: 0 }, { low: Number.NaN, high: 1 }, { low: Infinity, high: 0 }]) {
+		assert.equal(choiceProbability(raw, keys, 2).probabilityStatus, "invalid");
+		assert.equal(choiceProbability(raw, keys, 2).probabilities, undefined);
+	}
+});
+
+function exactDistribution(keys, choice) {
+	const rest = keys.filter((key) => key !== choice);
+	const probabilities = Object.fromEntries(keys.map((key) => [key, 0]));
+	if (!rest.length) probabilities[choice] = 1;
+	else { probabilities[choice] = 0.8; probabilities[rest[0]] = 0.2; }
+	return probabilities;
+}
+
+test("initial routing keeps the choice when probabilities are usable, rounded, tied, missing, or invalid", async (t) => {
+	const cases = [
+		["normal", (choice, keys) => ({ probabilities: exactDistribution(keys, choice) }), "available"],
+		["rounded", (choice, keys) => ({ probabilities: { [choice]: 0.6, [keys.find((key) => key !== choice)]: 0.39 }, rounding: { probabilityDecimals: 2 } }), "available"],
+		["tie", (choice, keys) => ({ probabilities: Object.fromEntries(keys.map((key) => [key, 0.5])) }), "available"],
+		["missing", () => ({}), "missing"],
+		["null", () => ({ probabilities: null }), "invalid"],
+		["string", (choice, keys) => ({ probabilities: { [choice]: "0.6", [keys.find((key) => key !== choice)]: 0.4 } }), "invalid"],
+		["extra", (choice, keys) => ({ probabilities: { ...exactDistribution(keys, choice), secret: 0 } }), "invalid"],
+		["sum", (choice, keys) => ({ probabilities: Object.fromEntries(keys.map((key) => [key, key === choice ? 0.2 : 0.2])) }), "invalid"],
+		["argmax", (choice, keys) => ({ probabilities: { [choice]: 0.2, [keys.find((key) => key !== choice)]: 0.8 } }), "available"],
+		["coarse-zero", (choice, keys) => ({ probabilities: Object.fromEntries(keys.map((key) => [key, 0])), rounding: { probabilityDecimals: 0 } }), "available"],
+	];
+	for (const [name, decorate, status] of cases) {
+		const requests = mockGateway(t, (_options, body) => {
+			const keys = Object.keys(body.questions.route.criteria);
+			const choice = Object.entries(body.questions.route.criteria).find(([, profile]) => profile.model === FAST)[0];
+			const extra = decorate(choice, keys);
+			return Response.json({ answers: { route: { type: "choice", choice, ...(extra.probabilities !== undefined ? { probabilities: extra.probabilities } : {}) } }, ...(extra.rounding ? { rounding: extra.rounding } : {}), usage: { inputTokens: 9, outputTokens: 1 } });
+		});
+		const id = `stat-prob-${name}`;
+		const h = await harness({ sessionId: id });
+		assert.equal((await h.stream(context("PRIVATE ROUTING PROMPT")).result()).model, "gpt-5.6-luna");
+		assert.equal(h.calls[0].options.reasoning, "max");
+		assert.equal(requests.length, 1, name);
+		const item = ledger(id).find((record) => record.kind === "evaluation" && record.question === "model");
+		assert.equal(item.outcome, "selected", name);
+		assert.equal(item.probabilityStatus, status, name);
+		assert.equal(item.stage, "final", name);
+		assert.equal(item.choice, `${FAST} @ max`, name);
+		assert.equal("description" in item, false, name);
+		const text = readFileSync(ledgerPath(id), "utf8");
+		assert.ok(!text.includes("PRIVATE ROUTING PROMPT"), name);
+		assert.ok(!text.includes("secret"), name);
+		if (status === "available") {
+			assert.ok(item.probabilities[`${FAST} @ max`] !== undefined, name);
+			assert.ok(item.probabilities[`${DEEP} @ xhigh`] !== undefined, name);
+			assert.equal(Object.hasOwn(item.probabilities, FAST), false, name);
+			assert.equal(Object.hasOwn(item.probabilities, DEEP), false, name);
+		} else assert.equal(item.probabilities, undefined, name);
+		if (name === "rounded") assert.equal(item.probabilities[`${DEEP} @ xhigh`], 0.39);
+		if (name === "tie") assert.equal(item.probabilities[`${FAST} @ max`], item.probabilities[`${DEEP} @ xhigh`]);
+		if (name === "argmax") {
+			assert.equal(item.probabilities[`${FAST} @ max`], 0.2);
+			assert.ok(item.probabilities[`${DEEP} @ xhigh`] > item.probabilities[`${FAST} @ max`]);
+		}
+	}
+});
+
+test("model and effort combination probabilities keep their own option meaning", async (t) => {
+	t.after(() => rmSync(settingsPath, { force: true }));
+	writeFileSync(settingsPath, JSON.stringify({ jevRouter: { options: {
+		[FAST]: { description: "UNIQUE_ROUTE_TEXT", thinking: { low: "Small", high: "Hard" } },
+		[DEEP]: { description: "Other", thinking: "max" },
+	}, fallback: DEEP } }));
+	mockGateway(t, (_options, body) => {
+		const keys = Object.keys(body.questions.route.criteria);
+		const choice = Object.entries(body.questions.route.criteria).find(([, profile]) => profile.model === FAST && profile.thinking === "low")[0];
+		return Response.json({ answers: { route: { type: "choice", choice, probabilities: exactDistribution(keys, choice) } }, usage: { inputTokens: 3, outputTokens: 1 } });
+	});
+	const id = "stat-combo";
+	const h = await harness({ sessionId: id });
+	h.models[0].thinkingLevelMap = { low: "low", high: "high" };
+	assert.equal((await h.stream().result()).model, "gpt-5.6-luna");
+	assert.equal(h.calls[0].options.reasoning, "low");
+	const item = ledger(id).find((record) => record.kind === "evaluation");
+	assert.equal(item.choice, `${FAST} @ low`);
+	assert.deepEqual(Object.keys(item.probabilities).sort(), [`${FAST} @ high`, `${FAST} @ low`, `${DEEP} @ max`].sort());
+	assert.equal(Object.hasOwn(item.probabilities, FAST), false);
+	assert.ok(!readFileSync(ledgerPath(id), "utf8").includes("UNIQUE_ROUTE_TEXT"));
+});
+
+test("adaptive effort and the low switch record effort probabilities without changing the selected level", async (t) => {
+	t.after(() => rmSync(settingsPath, { force: true }));
+	writeFileSync(settingsPath, JSON.stringify({ jevRouter: { options: { [DEEP]: { description: "Deep", thinking: "auto", adaptiveThinking: true } }, fallback: DEEP, monitor: false } }));
+	let mode = "distribution";
+	let desired = "high";
+	const requests = mockGateway(t, (_options, body) => {
+		const keys = Object.keys(body.questions.effort.criteria);
+		const choice = keys.includes(desired) ? desired : keys.at(-1);
+		const probabilities = mode === "invalid" ? null : exactDistribution(keys, choice);
+		return Response.json({ answers: { effort: { type: "choice", choice, ...(probabilities === null ? { probabilities: null } : { probabilities }) } }, usage: { inputTokens: 6, outputTokens: 1 } });
+	});
+	const adaptiveId = "stat-adaptive-prob";
+	const adaptive = await harness({ refs: [DEEP], responsesPayload: true, sessionId: adaptiveId, history: [{ name: "jev-pin", data: { target: DEEP, thinking: "medium", sessionId: adaptiveId } }] });
+	await adaptive.stream(context("PRIVATE ADAPTIVE")).result();
+	assert.equal(adaptive.calls[0].payload.input.at(-1).reasoning.effort, "high");
+	const adaptiveEval = ledger(adaptiveId).find((record) => record.kind === "evaluation" && record.question === "effort");
+	assert.equal(adaptiveEval.probabilityStatus, "available");
+	assert.equal(adaptiveEval.choice, "high");
+	assert.equal(adaptiveEval.stage, undefined);
+	assert.ok(Object.keys(adaptiveEval.probabilities).every((key) => !key.includes("/")));
+	assert.equal(Object.hasOwn(adaptiveEval.probabilities, DEEP), false);
+	mode = "invalid";
+	desired = "max";
+	await adaptive.stream(context("PRIVATE ADAPTIVE NEXT", 2)).result();
+	assert.equal(adaptive.calls[1].payload.input.at(-1).reasoning.effort, "max");
+	assert.equal(requests.length, 2);
+	const invalidAdaptive = ledger(adaptiveId).filter((record) => record.question === "effort" && record.kind === "evaluation").at(-1);
+	assert.equal(invalidAdaptive.outcome, "selected");
+	assert.equal(invalidAdaptive.probabilityStatus, "invalid");
+	assert.equal(invalidAdaptive.probabilities, undefined);
+	assert.equal(invalidAdaptive.thinking, "max");
+
+	mode = "distribution";
+	desired = "high";
+	const lowId = "stat-low-prob";
+	const low = await harness({ refs: [DEEP], sessionId: lowId });
+	low.ctx.model = low.models[0];
+	low.ctx.thinkingLevel = "low";
+	await low.handlers.get("context")({ messages: context("PRIVATE LOW").messages }, low.ctx);
+	const run = () => low.handlers.get("before_provider_request")({ payload: { input: [], reasoning: { effort: "low" } } }, low.ctx);
+	assert.equal((await run()).input.at(-1).reasoning.effort, "high");
+	const lowEval = ledger(lowId).find((record) => record.kind === "evaluation");
+	assert.equal(lowEval.question, "effort");
+	assert.equal(lowEval.choice, "high");
+	assert.equal(lowEval.probabilityStatus, "available");
+	assert.ok(Object.keys(lowEval.probabilities).includes("high"));
+	assert.equal(Object.hasOwn(lowEval.probabilities, DEEP), false);
+	mode = "invalid";
+	desired = "xhigh";
+	const before = requests.length;
+	assert.equal((await run()).input.at(-1).reasoning.effort, "xhigh");
+	assert.equal(requests.length, before + 1);
+	const invalidLow = ledger(lowId).filter((record) => record.kind === "evaluation").at(-1);
+	assert.equal(invalidLow.probabilityStatus, "invalid");
+	assert.equal(invalidLow.thinking, "xhigh");
+	assert.equal(ledger(lowId).filter((record) => record.kind === "applied").at(-1).outcome, "selected");
+	assert.ok(!readFileSync(ledgerPath(adaptiveId), "utf8").includes("PRIVATE"));
+	assert.ok(!readFileSync(ledgerPath(lowId), "utf8").includes("PRIVATE"));
+});
+
+test("fork suggestions record combination probabilities and do not switch the pinned model", async (t) => {
+	let desired = FAST;
+	mockGateway(t, (_options, body) => {
+		const entries = Object.entries(body.questions.route.criteria);
+		const choice = entries.find(([, profile]) => profile.model === desired)[0];
+		return Response.json({ answers: { route: { type: "choice", choice, probabilities: exactDistribution(entries.map(([key]) => key), choice) } }, usage: { inputTokens: 5, outputTokens: 1 } });
+	});
+	const id = "stat-monitor-prob";
+	const h = await harness({ sessionId: id });
+	await h.stream(context("PRIVATE FIRST")).result();
+	desired = DEEP;
+	assert.equal((await h.stream(context("PRIVATE SECOND", 3)).result()).model, "gpt-5.6-luna");
+	const suggestion = ledger(id).filter((record) => record.kind === "evaluation" && record.question === "model").at(-1);
+	assert.equal(suggestion.probabilityStatus, "available");
+	assert.equal(suggestion.choice, `${DEEP} @ xhigh`);
+	assert.ok(Object.keys(suggestion.probabilities).some((key) => key === `${FAST} @ max keep`));
+	assert.equal(Object.hasOwn(suggestion.probabilities, FAST), false);
+	assert.equal(Object.hasOwn(suggestion.probabilities, DEEP), false);
+	assert.equal(h.calls.at(-1).model.id, "gpt-5.6-luna");
+	assert.ok(!readFileSync(ledgerPath(id), "utf8").includes("PRIVATE"));
+});
+
+test("chunk assessments and the final decision keep separate probability records", async (t) => {
+	mockGateway(t, (_options, body) => {
+		const keys = Object.keys(body.questions.route.criteria);
+		const choice = body.state.stage === "chunk" && body.state.chunk.text.includes("PRIVATE_CHUNK_NEED") ? keys.at(-1) : keys[0];
+		return Response.json({ answers: { route: { type: "choice", choice, probabilities: exactDistribution(keys, choice) } }, usage: { inputTokens: 4, outputTokens: 1 } });
+	});
+	const id = "stat-chunk-prob";
+	const h = await harness({ sessionId: id });
+	const result = await h.stream(context(`${"a".repeat(30000)}\nPRIVATE_CHUNK_NEED\n${"b".repeat(20000)}`)).result();
+	const evals = ledger(id).filter((record) => record.kind === "evaluation" && record.question === "model");
+	const intermediate = evals.filter((record) => record.stage === "intermediate");
+	const finals = evals.filter((record) => record.stage === "final");
+	assert.ok(intermediate.length >= 1);
+	assert.equal(finals.length, 1);
+	assert.ok(intermediate.some((record) => record.choice !== finals[0].choice));
+	assert.equal(finals[0].probabilityStatus, "available");
+	assert.equal(finals[0].choice, `${finals[0].target} @ ${finals[0].thinking}`);
+	assert.equal(result.model, finals[0].target.slice(finals[0].target.indexOf("/") + 1));
+	assert.ok(!readFileSync(ledgerPath(id), "utf8").includes("PRIVATE_CHUNK_NEED"));
+});
+
+test("skill selection still uses boolean probabilities and does not store a choice distribution", async (t) => {
+	const skill = skillFixture("prob-skill");
+	mockSkillGateway(t, { "prob-skill": 0.95 });
+	configureSkills(t);
+	const h = await harness({ sessionId: "stat-skill-prob" });
+	await setSkills(h, [skill]);
+	const result = await h.handlers.get("context")({ messages: [user("Use prob-skill")] }, h.ctx);
+	assert.equal(result.messages.length, 2);
+	const item = ledger("stat-skill-prob").find((record) => record.question === "skill");
+	assert.equal(item.outcome, "selected");
+	assert.equal(item.probabilityStatus, undefined);
+	assert.equal(item.probabilities, undefined);
+	assert.ok(!readFileSync(ledgerPath("stat-skill-prob"), "utf8").includes("PRIVATE BODY"));
 });

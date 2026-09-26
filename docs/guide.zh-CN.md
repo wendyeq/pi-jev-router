@@ -87,7 +87,7 @@ pi list
 
 压缩会话这类辅助请求不重新判断，只沿用当前档。同一段上下文的重试也不会再评一次。
 
-Jev 返回 HTTP 503 时会立即重试一次；仍失败才使用 `fallback`。当前配置会钉到 sol，并给出警告。会话已经钉住之后再失败，不会改去后备模型，而是保持原模型。503 重试也适用于自适应强度、具体模型的 low 开关和技能匹配；再次失败时分别保持当前强度、沿用该模型上次成功判断的强度（无可用记录则保持 low），或跳过本次技能匹配。
+Jev 返回 HTTP 503 时会立即重试一次；仍失败才使用 `fallback`。当前配置会钉到 sol，并给出警告。会话已经钉住之后再失败，不会改去后备模型，而是保持原模型。503 重试也适用于自适应强度、具体模型的 low 开关和技能匹配；再次失败时分别保持当前强度、沿用该模型上次成功且仍不低于最低档的强度（无可用记录则用该模型最低档，未设置时为 low），或跳过本次技能匹配。
 
 `monitor` 打开时，Jev 可能建议 fork 到另一个模型，每个备选在本会话只提示一次。当前会话保持原模型。若要换，用 `/fork`，再在新会话里选模型和 Thinking。直接在原会话里改成具体模型会离开这条自动路由。
 
@@ -99,11 +99,11 @@ Pi 的 Thinking 菜单不能增加「auto」这一项。菜单上的 **low** 在
 2. Thinking 选 **low**。
 3. 发送任务。
 
-每次向该模型发请求前，Jev 都会看最近一条用户原文，以及最近 8 条用户、助手和工具结果，再选一个够用的档。工具续写也会重判。简单步骤可以停在 low；困难调试、架构或互相约束很多的问题可以升到 high、xhigh 或 max。
+每次向该模型发请求前，Jev 都会看最近一条用户原文，以及最近 8 条用户、助手和工具结果，再选一个够用的档。工具续写也会重判。简单步骤可以停在 low；困难调试、架构或互相约束很多的问题可以升到 high、xhigh 或 max。该模型的 `minThinking` 同样生效：低于它的档不会交给 Jev。例如 luna 和 sol 设为 `medium` 后，菜单仍显示 low，实际从 medium 起选。
 
 请求顶层的 effort 仍写着 low，实际档位放在 `configuration_update` 里，用来保留前缀缓存。变档发生在两次请求之间，不发生在同一次输出中途。
 
-Jev 超时、缺少 Gateway 密钥或返回无效档时，优先沿用本会话中同一模型上次成功判断的强度（重新加载后也有效）；没有可用记录，或这次请求无法写入更新时，按原来的 low 发出。
+Jev 超时、缺少 Gateway 密钥或返回无效档时，优先沿用本会话中同一模型上次成功判断、且仍不低于 `minThinking` 的强度（重新加载后也有效）；没有可用记录，或这次请求无法写入更新时，按该模型最低档发出。没设最低档时，最低档就是原来的 low。
 
 Thinking 选 medium、high、xhigh 或 max 时，就是固定那一档，不会再问 Jev。
 
@@ -132,7 +132,7 @@ Thinking 选 medium、high、xhigh 或 max 时，就是固定那一档，不会�
 | `effort failed` | 强度检查失败，沿用当前档。 |
 | `low-switch applied high` | 指定模型且菜单为 low，这次升到了 high。xhigh、max 同理。 |
 | `low-switch kept low` | 问过，判断 low 就够。 |
-| `low-switch failed` | 检查失败，优先沿用同模型上次成功判断的强度；没有可用记录时按 low 发出。 |
+| `low-switch failed` | 检查失败，优先沿用同模型上次成功且仍不低于最低档的强度；没有可用记录时按最低档发出。没设最低档时按 low 发出。 |
 
 失败原因只有这几个词：`budget`、`missing-key`、`invalid-choice`、`payload`、`timeout`、`unavailable`。接口返回的原文不会写进记录。
 
@@ -157,6 +157,14 @@ Thinking 选 medium、high、xhigh 或 max 时，就是固定那一档，不会�
 ```
 
 期望是 `low-switch kept low`，或只升到 `medium`。
+
+## 只读概率统计
+
+统计脚本和配套 skill 的正本都在 `skills/pi-jev-router-inspect`。`node scripts/inspect.mjs` 只是转调用它。把这个目录链接到 agent 的 skills 目录后，改仓库即改 skill。
+
+成功的 Choice 评估会把选项概率写进私有账本 `<Pi agent 目录>/jev-router/sessions/<session-id>.jsonl`。`node scripts/inspect.mjs show <session-id|latest>` 的 `probabilityDecisions` 列出每次最终评估的分布、最高项、次高项和差值；并列时差值为 0。分块路由的中间评估在 `intermediateProbabilities`，不和最终决策混在一起算。
+
+推理强度的键是档位名。首次选模型和换模型建议的键是「模型 @ 强度」；当前模型会带 `keep`。不要把这些数读成单独的模型概率。概率只说明选项拉开了多少，不代表任务成功，也不会自动换模型或升降档。没有概率记为缺失，校验不通过记为无效；这项字段出现之前的旧记录也视为缺失。两种情况都不改变当时的选择。只有一个候选项因而没发请求时，不会编造概率。账本仍然不记录正文、凭证或原始响应。
 
 ## 限制
 

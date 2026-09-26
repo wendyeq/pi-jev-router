@@ -16,9 +16,9 @@
   "pi": {
     "extensions": ["./index.ts"]
   },
-  "files": ["index.ts", "README.md", "LICENSE", "assets/logo.png", "docs/guide.zh-CN.md"],
+  "files": ["index.ts", "ledger.ts", "scripts/inspect.mjs", "skills/pi-jev-router-inspect", "README.md", "LICENSE", "assets/logo.png", "docs/guide.zh-CN.md"],
   "scripts": {
-    "test": "node --test tests/index.test.mjs"
+    "test": "node --test tests/index.test.mjs tests/inspect.test.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

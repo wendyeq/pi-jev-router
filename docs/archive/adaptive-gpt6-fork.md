@@ -1,6 +1,6 @@
 # Historical experiment: adaptiveThinking for gpt-6-luna / gpt-6-sol
 
-> Archived notes from an earlier fork. The branch, local paths, and installation instructions below describe that experiment, not the current `main` checkout. For current installation, see [README](../../README.md) or the [中文使用手册](../guide.zh-CN.md).
+> Historical bakeoff only. Do not use the branch name, `/workspace` paths, or install commands below. The behavior under test — `adaptiveThinking` for model ids `gpt-6-astra`, `gpt-6-luna`, and `gpt-6-sol`, any provider prefix — is now in this tree. Current instructions are the [README](../../README.md) and the [中文使用手册](../guide.zh-CN.md).
 
 Branch: `fork/adaptive-gpt6-luna-sol` (local at `/workspace/pi-jev-router`)
 

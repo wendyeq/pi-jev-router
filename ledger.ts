@@ -47,7 +47,10 @@ export function usageFields(result: unknown): Pick<JevStat, "inputTokens" | "out
 	const cost = (n: unknown) => typeof n === "number" && Number.isFinite(n) && n >= 0 ? n : typeof n === "string" && n.trim() !== "" && Number.isFinite(Number(n)) && Number(n) >= 0 ? Number(n) : undefined;
 	// The AI SDK's Gateway evaluation result may expose cost either directly or in provider metadata.
 	const metadata = value.providerMetadata as { gateway?: { cost?: unknown } } | undefined;
-	return { ...(tokens(value.usage?.inputTokens) !== undefined ? { inputTokens: tokens(value.usage?.inputTokens) } : {}),
-		...(tokens(value.usage?.outputTokens) !== undefined ? { outputTokens: tokens(value.usage?.outputTokens) } : {}),
-		...(cost(metadata?.gateway?.cost ?? value.cost) !== undefined ? { gatewayCostUsd: cost(metadata?.gateway?.cost ?? value.cost) } : {}) };
+	const inputTokens = tokens(value.usage?.inputTokens);
+	const outputTokens = tokens(value.usage?.outputTokens);
+	const gatewayCostUsd = cost(metadata?.gateway?.cost ?? value.cost);
+	return { ...(inputTokens !== undefined ? { inputTokens } : {}),
+		...(outputTokens !== undefined ? { outputTokens } : {}),
+		...(gatewayCostUsd !== undefined ? { gatewayCostUsd } : {}) };
 }

@@ -1,8 +1,13 @@
 # Jev Router 使用手册
 
-这份手册说明如何在 Pi 里用本仓库做两件事：让 Jev 选模型，以及在你指定 GPT-6 模型后，用 Thinking 菜单里的 **low** 让 Jev 按任务升降推理强度。
+这份手册只讲本仓库的两种用法。配置字段、隐私、费用和发布见仓库根目录的 [README](../README.md)。[archive](archive/adaptive-gpt6-fork.md) 是早期 bakeoff，不要按里面的路径安装。
 
-需要 Pi、Node.js 22.19 或更高，以及 Vercel AI Gateway 的密钥。生成请求仍走你在 Pi 里为 `openai` 配置的地址和密钥，不经过 Jev。
+| 用法 | 你选什么 | 推理强度 |
+| --- | --- | --- |
+| 自动选模型 | `auto / jev` | 钉住后，该路由打开了 `adaptiveThinking` 才会在后续请求里升降。 |
+| 指定模型 | `gpt-6-luna`、`gpt-6-sol` 或 `gpt-6-astra`，Thinking 选 **low** | 每次请求前问 Jev。不需要 `adaptiveThinking`。菜单上仍显示 low。 |
+
+需要 Pi、Node.js 22.19 或更高，以及 Vercel AI Gateway 的密钥。生成请求走所选模型在 Pi 里已经配置的 provider 和密钥，不经过 Jev。
 
 ## 安装
 
@@ -27,6 +32,8 @@ pi list
 ## 配置
 
 路由只读全局 `~/.pi/agent/settings.json` 里的 `jevRouter`。项目级设置不能覆盖它。改完后 `/reload`。已经钉住的会话不会改模型，也不会改最初那一档。
+
+不写 `jevRouter` 时，内置默认是 `openai-codex/gpt-5.6-luna`（`max`）、`openai-codex/gpt-5.6-sol`（`auto`）、`openai-codex/gpt-6-astra`（`xhigh`），后备是 astra。下面这份不是默认列表，写上后会整表替换它们。它同时覆盖两种用法：`adaptiveThinking` 只管 `auto / jev` 钉住之后的升降；指定模型并把菜单设为 low 时，没有这个字段也会问 Jev。
 
 三个 GPT-6 都打开自适应，后备模型用 sol：
 
@@ -81,7 +88,7 @@ pi list
 2. `/new` 开新会话。
 3. 直接写任务，不要在提示词里点名 luna、sol 或 astra。点名不会被当成选模型指令。
 
-第一条用户消息按三条 `description` 钉住一个模型，并选定初始推理强度。之后这个会话不再换模型。主会话里的后续请求，包括工具返回后的下一步，会再问 Jev 要不要升降推理强度。一次回复正在输出时不会改档。
+第一条用户消息按三条 `description` 钉住一个模型，并选定初始推理强度。之后这个会话不再换模型。该路由打开了 `adaptiveThinking` 时，主会话里的后续请求，包括工具返回后的下一步，会再问 Jev 要不要升降推理强度。没打开就停在初始档。一次回复正在输出时不会改档。
 
 状态栏类似 `auto: openai/gpt-6-sol (high, adaptive)`。`adaptive` 表示还会继续升降；`pinned` 表示停在初始档。
 
@@ -93,7 +100,7 @@ Jev 返回 HTTP 503 时会立即重试一次；仍失败才使用 `fallback`。�
 
 ## 用法二：指定模型，用 low 升降推理强度
 
-Pi 的 Thinking 菜单不能增加「auto」这一项。菜单上的 **low** 在这三个模型上被用作开关，显示名字仍然是 low。
+Pi 的 Thinking 菜单不能增加「auto」这一项。菜单上的 **low** 在这三个模型 id 上被用作开关，显示名字仍然是 low。provider 前缀不限。这个开关不读取 `adaptiveThinking`。
 
 1. 模型选 `openai/gpt-6-luna`、`openai/gpt-6-sol` 或 `openai/gpt-6-astra`，不要选 auto / jev。
 2. Thinking 选 **low**。

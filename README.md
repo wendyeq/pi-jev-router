@@ -10,7 +10,7 @@
   <a href="https://pi.dev"><img src="https://img.shields.io/badge/Pi-0.85.1%2B-f8b86d?style=flat-square" alt="Pi 0.85.1 or later"></a>
 </p>
 
-Let [TypeSafe's Jev](https://vercel.com/ai-gateway/models/jev) choose a model and reasoning effort for [Pi](https://pi.dev). The model stays fixed for the session. Effort stays fixed too, unless you enable adaptive effort for Codex Astra. Generation uses your existing Pi providers and credentials.
+Let [TypeSafe's Jev](https://vercel.com/ai-gateway/models/jev) choose a model and reasoning effort for [Pi](https://pi.dev). The model stays fixed for the session. Effort stays fixed too, unless adaptive effort is enabled for a route whose model id is `gpt-6-astra`, `gpt-6-luna`, or `gpt-6-sol`, or you use the thinking menu's `low` entry on one of those models. Generation uses your existing Pi providers and credentials.
 
 ## Get started
 
@@ -22,7 +22,11 @@ pi install npm:pi-jev-router
 
 Git also works: `pi install git:github.com/mejiasd3v/pi-jev-router`. Keep only one installation.
 
-For local installation and GPT-6 Thinking-menu examples, see the [中文使用手册](docs/guide.zh-CN.md). The [adaptive GPT-6 fork notes](https://github.com/mejiasd3v/pi-jev-router/blob/main/docs/archive/adaptive-gpt6-fork.md) are historical experiment records, not current installation instructions.
+| Document | What it is |
+| --- | --- |
+| This README | Configuration, session rules, privacy, cost, and publishing. |
+| [中文使用手册](docs/guide.zh-CN.md) | Local install and the two GPT-6 workflows: `auto/jev`, and a concrete model with the thinking menu set to `low`. |
+| [Archive](docs/archive/adaptive-gpt6-fork.md) | Old bakeoff notes and paths. Not installation instructions. |
 
 1. Use `/login` for your generation provider and `/login vercel-ai-gateway` for Jev. `AI_GATEWAY_API_KEY` also works.
 2. Run `/reload`, then `/model auto/jev`.
@@ -72,13 +76,13 @@ Use Luna for known-approach execution, Sol for bounded investigation and impleme
 
 Levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Automatic choices are filtered to supported levels. Model and effort are chosen in one evaluation: task fit determines the model first, then Jev selects the lowest sufficient allowed effort within that model. Effort labels are model-relative; another model's lower label does not make it a better fit. A configured floor can intentionally exceed what a routine task needs.
 
-Set `jevRouter.minThinking` for a global floor, and `minThinking` inside a model's option for a stricter per-model floor. For example, global `"medium"` plus Luna `"high"` lets Jev choose medium or higher for Astra and high or higher for Luna when both use `"thinking": "auto"`. An omitted model minimum inherits the global floor. Only `openai-codex/gpt-6-astra` can override it: an explicit Astra `"minThinking": "low"` permits low effort even with global `"medium"`, for both initial routing and adaptive effort. Other models can only raise the global floor. Both fields are optional and default to no additional restriction.
+Set `jevRouter.minThinking` for a global floor, and `minThinking` inside a model's option for a per-model floor. For example, global `"medium"` plus a non-GPT-6 route at `"high"` lets Jev choose medium or higher for routes that omit a model floor, and high or higher for that stricter route, when both use `"thinking": "auto"`. An omitted model minimum inherits the global floor. A route whose model id is `gpt-6-astra`, `gpt-6-luna`, or `gpt-6-sol` may set its own floor below the global one: an explicit `"minThinking": "low"` permits low effort even with global `"medium"`, for initial routing, adaptive effort, and the thinking-menu `low` switch. The provider prefix is not part of this check. Every other model can only raise the global floor. Both fields are optional and default to no additional restriction.
 
 Automatic and custom choices below the floor are excluded. Fixed or inherited effort below the floor is raised to the lowest supported level meeting it. Routes with no eligible level are excluded, including non-reasoning models when the floor is above `off`; fallback errors if it has no eligible choice. `/jev` shows configured minimums. Reload after editing; existing session pins keep their original effort.
 
-### Adaptive Astra effort (opt-in)
+### Adaptive GPT-6 effort (opt-in)
 
-Set `"adaptiveThinking": true` inside the `openai-codex/gpt-6-astra` option, alongside `"thinking": "auto"` or custom thinking choices. Other models and fixed/inherited effort policies do not accept this flag.
+Set `"adaptiveThinking": true` on a route whose model id is `gpt-6-astra`, `gpt-6-luna`, or `gpt-6-sol`, alongside `"thinking": "auto"` or custom thinking choices. The provider prefix is ignored, so `openai/gpt-6-luna` and `gpt-load/gpt-6-sol` qualify. Any other model id, or a fixed or inherited effort policy, is rejected when the extension loads.
 
 ```json
 "openai-codex/gpt-6-astra": {
@@ -90,12 +94,12 @@ Set `"adaptiveThinking": true` inside the `openai-codex/gpt-6-astra` option, alo
 
 After the initial route, Jev assesses the next step before each main model request, including tool continuations. It can raise effort for unresolved failures or difficult decisions and lower it for routine work. It chooses only supported levels allowed by your choices and minimums. This is a heuristic, not a guarantee that Jev detects every stall. Changes take effect between responses, never inside a running response.
 
-- **Keep the model and request prefix.** The original request-level effort stays fixed. Changes use Astra's append-only `configuration_update` items, replayed at their original input positions. This follows [OpenAI's cache-preserving mechanism](https://developers.openai.com/api/docs/guides/reasoning#change-reasoning-mid-conversation); normal cache requirements still apply. Do not use provider-side automatic compaction, automatic truncation, or another hook that inserts configuration updates.
+- **Keep the model and request prefix.** The original request-level effort stays fixed. Changes use that model's append-only `configuration_update` items, replayed at their original input positions. This follows [OpenAI's cache-preserving mechanism](https://developers.openai.com/api/docs/guides/reasoning#change-reasoning-mid-conversation); normal cache requirements still apply. Do not use provider-side automatic compaction, automatic truncation, or another hook that inserts configuration updates.
 - **Persist and recover.** Decisions follow the active branch across reload/resume. If local Pi compaction or edited history invalidates an update's original prefix, the current effort is re-established on the rebuilt input. Forks choose afresh. Auxiliary requests reuse effort without evaluating or saving changes.
 - **Bound overhead.** At most one additional evaluation per distinct request context, bounded by `timeoutMs`, with no retries and a 28,000-byte request budget. Failure retains current effort; cancellation stops the request. `monitor: false` disables model-switch suggestions, not adaptive effort.
 - **See changes.** Notifications, the status line, and `/jev` show current effort. `/jev` also shows the initial effort used at request level. Pi's thinking picker still does not control or track the router's effort.
 
-Reload after changing the flag. Enabling it can adapt an existing Astra pin on its next request. Disabling it stops new decisions but preserves and replays prior updates; use a new session for a fresh pin.
+Reload after changing the flag. Enabling it can adapt an existing pin of one of these models on its next request. Disabling it stops new decisions but preserves and replays prior updates; use a new session for a fresh pin. This flag is separate from the thinking-menu `low` switch described under session behavior: that switch does not require `adaptiveThinking`.
 
 **Additional data and cost:** effort checks send the latest user-text excerpt plus up to eight recent user, assistant, and tool-result excerpts to Vercel/TypeSafe. Each excerpt keeps up to 1,600 characters, split between its beginning and end. Tool names and error flags are included; tool-call arguments, reasoning blocks, images, and system messages are excluded. Tool-result text can contain secrets and is not redacted. These evaluations are billed separately and appear separately in read-only session statistics when recorded.
 
@@ -123,7 +127,7 @@ Tasks over **192,000 UTF-8 bytes**, excessive chunk plans, or incomplete evaluat
 
 ## Session behavior
 
-- **Pin once.** The model and initial effort survive tool calls, compaction, `/reload`, and `/resume`. Effort remains fixed unless adaptive Astra effort is enabled. `/new`, `/fork`, and `/clone` choose afresh. Model and initial-effort configuration changes don't rewrite existing pins.
+- **Pin once.** The model and initial effort survive tool calls, compaction, `/reload`, and `/resume`. Effort remains fixed unless adaptive effort is enabled for that GPT-6 route. `/new`, `/fork`, and `/clone` choose afresh. Model and initial-effort configuration changes don't rewrite existing pins.
 - **Suggest, never switch.** Monitoring checks new user text and may suggest a fork with another model, once per alternative per session. Use `/fork`, then `/model` and `/thinking` in the fork to follow it. No automatic forks or model switches.
 - **Control overhead.** A Jev HTTP 503 gets one immediate retry within the same timeout; if it fails again, the normal fallback/keep-current behavior applies. Routing and model-monitor evaluation timeouts retry up to three attempts of `timeoutMs` each (1 to 60,000 ms). The entire operation shares a ceiling of **3 × `timeoutMs`**, including chunks and combination: 15 seconds by default. Skill and effort checks also retry 503 once but do not retry timeouts. Set `"monitor": false` to disable model-switch advisory checks; tool continuations don't trigger those checks. Adaptive effort has its own per-request check described above.
 - **Fail explicitly.** Initial routing failures use the fallback, with its fixed/inherited effort or highest supported automatic choice. If an existing pin becomes unavailable or cannot accept the input, the router errors instead of switching.

@@ -717,6 +717,40 @@ test("luna and sol low switch starts at medium, including when the check fails",
 	assert.equal(traces().at(-1).data.thinking, "low");
 });
 
+test("low switch tells Jev the effort this session last applied", async (t) => {
+	t.after(() => rmSync(settingsPath, { force: true }));
+	writeFileSync(settingsPath, JSON.stringify({ jevRouter: { options: {
+		[DEEP]: { description: "Deep", thinking: "auto" },
+		[FAST]: { description: "Fast", thinking: "auto" },
+	}, fallback: DEEP } }));
+	let mode = "low";
+	const requests = mockGateway(t, () => mode);
+	const h = await harness({ refs: [FAST, DEEP] });
+	const astra = h.models.find((model) => model.id === "gpt-6-astra");
+	const payload = { input: [{ role: "user", content: "Fix the failure" }], reasoning: { effort: "low", summary: "auto" } };
+	const ask = async () => {
+		h.ctx.model = astra;
+		h.ctx.thinkingLevel = "low";
+		await h.handlers.get("context")({ messages: context("Fix the failure").messages }, h.ctx);
+		return h.handlers.get("before_provider_request")({ payload }, h.ctx);
+	};
+	assert.equal(await ask(), undefined);
+	assert.equal(requests.at(-1).state.currentThinking, "low", "without a prior decision the current effort is the menu level");
+	assert.match(requests.at(-1).questions.effort.instructions, /Keep current effort unless there is a clear reason to change/);
+	mode = "high";
+	assert.deepEqual((await ask()).input.at(-1), { type: "configuration_update", reasoning: { effort: "high" } });
+	assert.equal(requests.at(-1).state.currentThinking, "low", "the reported effort predates this request's own decision");
+	mode = "low";
+	assert.equal(await ask(), undefined, "a raised effort can still come back down");
+	assert.equal(requests.at(-1).state.currentThinking, "high", "the raised effort becomes the current effort");
+	const other = await harness({ history: h.entries, sessionId: "other" });
+	other.ctx.model = other.models.find((model) => model.id === "gpt-6-astra");
+	other.ctx.thinkingLevel = "low";
+	await other.handlers.get("context")({ messages: context("New session").messages }, other.ctx);
+	await other.handlers.get("before_provider_request")({ payload }, other.ctx);
+	assert.equal(requests.at(-1).state.currentThinking, "low", "another session cannot inherit the previous effort");
+});
+
 test("effort payload preserves headers/settings, rejects incompatible modes, and maps provider effort names", () => {
 	const body = { input: [{ role: "user", content: "Task" }], reasoning: { effort: "high", summary: "auto" }, prompt_cache_key: "session", tools: [] };
 	const high = effortPayload(body, [], "high", "medium");

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -93,6 +93,28 @@ test('sessions and show read only the selected safe ledger file', async () => {
     assert.ok(!cli.stdout.includes('SECRET_MESSAGE'));
     assert.equal(JSON.parse(cli.stdout).sessionId, 'safe-id');
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('cli still runs when the script is reached through a symlink', async () => {
+  // A skill installed as ~/.agents/skills/<name> -> checkout is invoked through the link, so the
+  // entry-point check must not depend on argv[1] and import.meta.url being the same string.
+  const dir = await mkdtemp(join(tmpdir(), 'jev-inspect-ledger-'));
+  const linkDir = await mkdtemp(join(tmpdir(), 'jev-inspect-link-'));
+  const entryPoints = [script, fileURLToPath(new URL('../skills/pi-jev-router-inspect/scripts/inspect.mjs', import.meta.url))];
+  try {
+    await writeFile(join(dir, 'safe-id.jsonl'), stat(base));
+    for (const [index, entry] of entryPoints.entries()) {
+      const link = join(linkDir, `inspect-${index}.mjs`);
+      await symlink(entry, link);
+      const cli = spawnSync(process.execPath, [link, '--state-dir', dir, 'show', 'safe-id'], { encoding: 'utf8' });
+      assert.equal(cli.status, 0, cli.stderr);
+      assert.notEqual(cli.stdout.trim(), '', 'a symlinked entry point printed nothing');
+      assert.equal(JSON.parse(cli.stdout).sessionId, 'safe-id');
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    await rm(linkDir, { recursive: true, force: true });
+  }
 });
 
 test('show reports top, runner-up, and margin without mixing stages or old records', () => {

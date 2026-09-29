@@ -1,8 +1,9 @@
 #!/usr/bin/env node
+import { realpathSync } from 'node:fs';
 import { readdir, readFile, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 
 // Match Pi's session ID alphabet; never accept a path separator or dot-segment.
 const idPattern = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$/;
@@ -119,6 +120,23 @@ export async function inspect(argv, env = process.env) {
   throw new Error('Usage: inspect.mjs [--state-dir DIR] sessions | show <session-id|latest>');
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+/**
+ * Whether the file identified by `moduleUrl` is the process entry point.
+ *
+ * Compares resolved paths rather than URLs: an installed skill is reached through a symlink
+ * (`~/.agents/skills/<name>` -> checkout), and then `process.argv[1]` keeps the link while
+ * `import.meta.url` is already the real path. The URLs never compare equal in that case, so a
+ * URL comparison silently skips the CLI body and exits 0 with no output.
+ */
+export const isMainModule = (moduleUrl) => {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(moduleUrl));
+  } catch {
+    return false;
+  }
+};
+
+if (isMainModule(import.meta.url)) {
   inspect(process.argv.slice(2)).then((result) => console.log(JSON.stringify(result, null, 2))).catch((error) => { console.error(error.message); process.exitCode = 1; });
 }

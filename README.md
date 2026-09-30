@@ -32,6 +32,10 @@ Git also works: `pi install git:github.com/mejiasd3v/pi-jev-router`. Keep only o
 2. Run `/reload`, then `/model auto/jev`.
 3. Start with your actual task. `/jev` shows the pin, selected effort, and fork suggestions.
 
+## Shared effort policy
+
+Automatic effort for `gpt-6-astra`, `gpt-6-luna`, and `gpt-6.1-sol` is implemented in the sibling directory `../jev-router-policy`, not in this package. `index.ts` imports `../jev-router-policy/src/index.ts` at runtime. There is no build step and no `package.json` dependency. Pi loads that file when it loads this extension, so `/reload` picks up changes to either file. An already running session does not. `pi install npm:pi-jev-router` does not include the sibling; this checkout expects the directory beside the repository. Changing the pinned model or its initial effort still applies only to a new session.
+
 ## Configure
 
 Merge `jevRouter` into **global** `~/.pi/agent/settings.json`, then `/reload`:

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createRequire } from "node:module";
 import { join } from "node:path";
@@ -23,7 +23,27 @@ const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 const agentDir = mkdtempSync(join(tmpdir(), "jev-settings-"));
 const settingsPath = join(agentDir, "settings.json");
 process.env.PI_CODING_AGENT_DIR = agentDir;
-after(() => {
+let expectedRequestRecords = 0, failedRequestRecords = 0;
+const requestDir = join(agentDir, "jev-router", "requests");
+function requestRecords(id) {
+	const files = existsSync(requestDir) && lstatSync(requestDir).isDirectory() ? readdirSync(requestDir) : [];
+	return files.filter((name) => id === undefined || name === `${id}.jsonl`).flatMap((name) => {
+		const path = join(requestDir, name);
+		if (!name.endsWith(".jsonl") || !lstatSync(path).isFile()) return [];
+		const text = readFileSync(path, "utf8");
+		// Ignore only an in-progress final line; complete rows must parse.
+		return text.slice(0, text.lastIndexOf("\n") + 1).split("\n").filter(Boolean).map(JSON.parse);
+	});
+}
+async function waitForRequestWrites(check = () => requestRecords().length + failedRequestRecords >= expectedRequestRecords) {
+	const deadline = Date.now() + 5000;
+	while (!check()) {
+		assert.ok(Date.now() < deadline, "asynchronous request records did not finish");
+		await delay(10);
+	}
+}
+after(async () => {
+	await waitForRequestWrites();
 	if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 	else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
 	rmSync(agentDir, { recursive: true, force: true });
@@ -95,7 +115,10 @@ async function harness({ refs = [FAST, DEEP], gatewayKey = true, backendError = 
 			getBranch: () => entries.map(({ name, data }) => ({ type: "custom", customType: name, data })),
 			buildContextEntries: () => entries.map(({ name, data }) => ({ type: "custom", customType: name, data })),
 		},
-		ui: { setStatus() {}, notify: (...args) => notices.push(args) },
+		ui: { setStatus() {}, notify: (...args) => {
+			if (args[0] === "Jev request log write failed") failedRequestRecords++;
+			notices.push(args);
+		} },
 	};
 	const pi = {
 		registerProvider(provider, value) {
@@ -118,9 +141,13 @@ async function harness({ refs = [FAST, DEEP], gatewayKey = true, backendError = 
 	};
 }
 
-function mockGateway(t, respond = () => FAST) {
+// Independent legacy wire oracle: never derive expected bytes from the shared serializer.
+const legacyJevBody = (state, questions) => JSON.stringify({ model: "typesafe-ai/jev", state, questions });
+
+function mockGateway(t, respond = () => FAST, { record = true } = {}) {
 	const previous = globalThis.fetch;
 	const requests = [];
+	requests.bodies = [];
 	globalThis.fetch = async (url, options) => {
 		assert.equal(String(url), "https://ai-gateway.vercel.sh/v1/evaluate");
 		assert.equal(options.method, "POST");
@@ -128,7 +155,11 @@ function mockGateway(t, respond = () => FAST) {
 		assert.equal(new Headers(options.headers).get("content-type"), "application/json");
 		const body = JSON.parse(options.body);
 		assert.equal(body.model, "typesafe-ai/jev");
+		assert.equal(options.body, legacyJevBody(body.state, body.questions), "exact legacy bytes and model/state/questions order");
+		assert.ok(Buffer.byteLength(options.body, "utf8") <= 28_000, "wire bytes fit the complete evaluation budget");
 		requests.push(body);
+		requests.bodies.push(options.body);
+		if (record) expectedRequestRecords++;
 		const result = await respond(options, body);
 		if (result instanceof Response) return result;
 		if (body.questions.effort) return Response.json({ answers: { effort: { type: "choice", choice: typeof result === "string" ? result : result.thinking } }, usage: { inputTokens: 1000, outputTokens: 0 } });
@@ -137,7 +168,7 @@ function mockGateway(t, respond = () => FAST) {
 			profile.model === desired.target && (desired.thinking === undefined || profile.thinking === desired.thinking))?.[0] ?? "unoffered-profile";
 		return Response.json({ answers: { route: { type: "choice", choice } }, usage: { inputTokens: 1000, outputTokens: 0 } });
 	};
-	t.after(() => { globalThis.fetch = previous; });
+	t.after(async () => { globalThis.fetch = previous; await waitForRequestWrites(); });
 	return requests;
 }
 
@@ -167,6 +198,131 @@ function mockSkillGateway(t, probabilities = {}) {
 }
 
 const skillContext = (h, messages) => h.handlers.get("context")({ messages }, h.ctx);
+
+test("request records equal every fetch attempt, retain owning sessions, and leave the metadata inspector unchanged", async (t) => {
+	let attempts = 0;
+	const requests = mockGateway(t, () => ++attempts === 1 ? Response.json({ error: "private response" }, { status: 503 }) : FAST);
+	const h = await harness({ sessionId: "request-log-main" });
+	const input = context(`PRIVATE_TASK_HEAD汉🙂${"\\\"escaped汉🙂".repeat(5000)}PRIVATE_TASK_TAIL`);
+	const unchanged = structuredClone(input);
+	await h.stream(input).result();
+	await h.stream(context("PRIVATE_MONITOR_TASK", 2)).result();
+	assert.deepEqual(input, unchanged);
+	assert.equal(h.calls[0].context, input, "the main model receives the original full task");
+	assert.equal(requests.length, 3, "retry and monitor are individual HTTP attempts");
+	assert.equal(requests.bodies[0], requests.bodies[1], "retry sends identical fitted bytes");
+	await waitForRequestWrites();
+	const rows = requestRecords("request-log-main");
+	assert.equal(rows.length, requests.length);
+	assert.deepEqual(rows.map((row) => row.body).sort(), [...requests.bodies].sort());
+	for (const row of rows) {
+		assert.deepEqual(Object.keys(row), ["time", "sessionId", "body"]);
+		assert.equal(row.sessionId, "request-log-main");
+		assert.equal(new Date(row.time).toISOString(), row.time);
+		assert.doesNotMatch(JSON.stringify(row), /gateway-test-key|codex-test-key|router-secret|Authorization|Content-Type|private response/);
+	}
+	assert.match(rows.map((row) => row.body).join("\n"), /PRIVATE_TASK_HEAD|PRIVATE_MONITOR_TASK/, "request bodies intentionally remain unredacted");
+	assert.equal(statSync(requestDir).mode & 0o777, 0o700);
+	assert.equal(statSync(join(requestDir, "request-log-main.jsonl")).mode & 0o777, 0o600);
+	const { inspect } = await import("../scripts/inspect.mjs");
+	const stats = await inspect(["show", "request-log-main", "--state-dir", join(agentDir, "jev-router", "sessions")]);
+	assert.equal(stats.aggregates.model.httpAttempts, 3);
+	assert.doesNotMatch(JSON.stringify(stats), /PRIVATE_TASK|PRIVATE_MONITOR|gateway-test-key/);
+	const fork = await harness({ sessionId: "request-log-fork", history: h.entries });
+	await fork.stream(context("Fork task", 3)).result();
+	await waitForRequestWrites();
+	assert.deepEqual(requestRecords("request-log-fork").map((row) => [row.sessionId, row.body]), [["request-log-fork", requests.bodies[3]]]);
+});
+
+test("request recording captures session and agent directory before credential lookup and keeps all retries with that owner", async (t) => {
+	let attempts = 0;
+	const requests = mockGateway(t, () => ++attempts === 1 ? Response.json({}, { status: 503 }) : FAST);
+	const h = await harness({ sessionId: "request-log-owner" });
+	const waiting = Promise.withResolvers(), credentials = Promise.withResolvers();
+	h.ctx.modelRegistry.getProviderAuth = async () => { waiting.resolve(); return credentials.promise; };
+	const input = context("Original owner task");
+	const pending = h.stream(input).result();
+	await waiting.promise;
+	const otherDir = mkdtempSync(join(tmpdir(), "jev-other-agent-"));
+	try {
+		h.ctx.sessionManager.getSessionId = () => "request-log-not-owner";
+		process.env.PI_CODING_AGENT_DIR = otherDir;
+		credentials.resolve({ auth: { apiKey: "gateway-test-key" } });
+		assert.equal((await pending).model, "gpt-5.6-luna");
+		await waitForRequestWrites();
+		assert.deepEqual(requestRecords("request-log-owner").map((row) => row.body), requests.bodies);
+		assert.equal(requestRecords("request-log-not-owner").length, 0);
+		assert.equal(existsSync(join(otherDir, "jev-router", "requests")), false);
+		assert.equal(h.calls[0].context, input);
+	} finally {
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		await waitForRequestWrites();
+		rmSync(otherDir, { recursive: true, force: true });
+	}
+});
+
+test("request logs skip no-HTTP paths and reject unsafe session filenames without changing network behavior", async (t) => {
+	const requests = mockGateway(t);
+	await (await harness({ refs: [FAST], sessionId: "request-log-single" })).stream().result();
+	await (await harness({ sessionId: "request-log-auxiliary" })).stream(context("Synthetic summary"), { sessionId: "compaction" }).result();
+	await (await harness({ gatewayKey: false, sessionId: "request-log-no-key" })).stream().result();
+	t.after(() => rmSync(settingsPath, { force: true }));
+	writeFileSync(settingsPath, JSON.stringify({ jevRouter: { options: { [FAST]: { description: "x".repeat(30000) }, [DEEP]: { description: "Deep" } }, fallback: DEEP } }));
+	await (await harness({ sessionId: "request-log-budget" })).stream().result();
+	rmSync(settingsPath);
+	assert.equal(requests.length, 0);
+	for (const id of ["request-log-single", "request-log-auxiliary", "request-log-no-key", "request-log-budget"]) assert.equal(requestRecords(id).length, 0);
+	const invalid = mockGateway(t, () => FAST, { record: false });
+	for (const sessionId of ["../request-escape", "/request-absolute", "bad/session", ".", "..", "trailing.", "nul\0id"]) {
+		const h = await harness({ sessionId });
+		assert.equal((await h.stream(context("Unsafe ID still routes")).result()).model, "gpt-5.6-luna");
+		assert.ok(h.notices.some(([message, level]) => message === "Jev request log skipped: invalid session ID." && level === "warning"));
+	}
+	assert.equal(invalid.length, 7);
+	assert.equal(existsSync(join(agentDir, "jev-router", "request-escape.jsonl")), false);
+	await waitForRequestWrites();
+});
+
+test("request records cover model, monitoring, adaptive, skill and low-switch sends with unchanged legacy envelopes", async (t) => {
+	const skill = skillFixture("wire-parity");
+	t.after(() => rmSync(settingsPath, { force: true }));
+	writeFileSync(settingsPath, JSON.stringify({ jevRouter: { options: {
+		[FAST]: { description: "Routine", thinking: "max" },
+		[DEEP]: { description: "Deep", thinking: "auto", adaptiveThinking: true },
+	}, fallback: DEEP, minThinking: "medium", skills: true } }));
+	const requests = mockGateway(t, (_options, body) => {
+		if (body.questions.route) return { target: body.questions.route.instructions.startsWith("This session") ? FAST : DEEP, thinking: body.questions.route.instructions.startsWith("This session") ? "max" : "medium" };
+		if (body.questions.effort) return "high";
+		return Response.json({ answers: Object.fromEntries(Object.keys(body.questions).map((key) => [key, { type: "boolean", probability: 0.95 }])) });
+	});
+	const h = await harness({ sessionId: "wire-parity-route", responsesPayload: true });
+	const input = context(`HEAD\\\"汉🙂${"middle\\\"汉🙂".repeat(6000)}TAIL`);
+	const unchanged = structuredClone(input);
+	await h.stream(input).result();
+	assert.deepEqual(input, unchanged, "budget fitting never alters main-model input");
+	assert.equal(h.calls[0].context, input);
+	await h.stream(context("Investigate a new failure", 2)).result();
+	const concrete = await harness({ sessionId: "wire-parity-concrete", refs: [DEEP] });
+	concrete.ctx.model = concrete.models[0];
+	concrete.ctx.thinkingLevel = "low";
+	await setSkills(concrete, [skill]);
+	await skillContext(concrete, [user("Use the specific skill; quotes \\\" and 汉🙂")]);
+	await concrete.handlers.get("before_provider_request")({ payload: { reasoning: { effort: "low" }, input: [{ role: "user", content: "Original input" }] } }, concrete.ctx);
+	assert.equal(requests.length, 5);
+	assert.deepEqual(requests.map((body) => body.questions.route ? "route" : body.questions.effort ? "effort" : "skill"), ["route", "route", "effort", "skill", "effort"]);
+	const task = [{ role: "user", text: "Investigate a new failure" }];
+	assert.deepEqual(requests[1].state, { messages: task });
+	assert.deepEqual(requests[2].state, { modelId: DEEP, currentEffort: "medium", messages: task });
+	const skillTask = [{ role: "user", text: "Use the specific skill; quotes \\\" and 汉🙂" }];
+	assert.deepEqual(requests[3].state, { messages: skillTask });
+	assert.deepEqual(requests[4].state, { modelId: DEEP, currentEffort: null, messages: skillTask });
+	for (const [index, state] of [[1, { messages: task }], [2, { modelId: DEEP, currentEffort: "medium", messages: task }], [3, { messages: skillTask }], [4, { modelId: DEEP, currentEffort: null, messages: skillTask }]]) {
+		assert.equal(requests.bodies[index], legacyJevBody(state, requests[index].questions));
+	}
+	await waitForRequestWrites();
+	assert.deepEqual(requestRecords("wire-parity-route").map((row) => row.body).sort(), requests.bodies.slice(0, 3).sort());
+	assert.deepEqual(requestRecords("wire-parity-concrete").map((row) => row.body).sort(), requests.bodies.slice(3).sort());
+});
 
 test("skills are opt-in and work with concrete models without changing routing", async (t) => {
 	const skill = skillFixture("opt-in");
@@ -641,6 +797,7 @@ test("concrete GPT-6 low thinking asks Jev and keeps low when the check fails", 
 	globalThis.fetch = async (...args) => {
 		if (!retried) {
 			retried = true;
+			expectedRequestRecords++;
 			return Response.json({ error: "PRIVATE TRANSIENT EFFORT" }, { status: 503 });
 		}
 		return previousFetch(...args);

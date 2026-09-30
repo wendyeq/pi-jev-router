@@ -14,14 +14,13 @@ import {
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 import { getAgentDir, stripFrontmatter, type ContextEvent, type ExtensionAPI, type ExtensionContext, type Skill } from "@earendil-works/pi-coding-agent";
-import { appendStat, usageFields, type JevStat } from "./ledger.ts";
+import { appendStat, isSafeSessionId, usageFields, type JevStat } from "./ledger.ts";
+import { serializeJevRequest, sendJevRequest, type RequestRecord } from "../jev-router-policy/src/client.ts";
 import { EFFORT_INSTRUCTIONS, POLICY_VERSION, classifyApplication, decideEffort, effortCriteria, effortState, fallbackEffort, fitEvidenceToBudget, prepareEvidence, readAnswerConfidence, readAnswerProbabilities, readProbabilityDecimals, unifiedEffortCandidates } from "../jev-router-policy/src/index.ts";
 
 const PROVIDER = "auto";
 const MODEL = "jev";
 const GATEWAY = "vercel-ai-gateway";
-const EVALUATE_URL = "https://ai-gateway.vercel.sh/v1/evaluate";
-const JEV_MODEL = "typesafe-ai/jev";
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 const EVALUATION_ATTEMPTS = 3;
@@ -53,12 +52,8 @@ function allowsAdaptiveMinOverride(model: Model<Api>): boolean {
 
 class RoutingBudgetError extends Error {}
 
-function evaluationBody(state: unknown, questions: unknown) {
-	return { model: JEV_MODEL, state, questions };
-}
-
 function fitsEvaluation(state: unknown, questions: unknown) {
-	return Buffer.byteLength(JSON.stringify(evaluationBody(state, questions)), "utf8") <= EVALUATION_BYTES;
+	return Buffer.byteLength(serializeJevRequest(state, questions), "utf8") <= EVALUATION_BYTES;
 }
 
 const AUTO_THINKING: Record<ModelThinkingLevel, string> = {
@@ -362,14 +357,12 @@ async function gatewayKey(ctx: ExtensionContext, signal?: AbortSignal): Promise<
 }
 
 /** POST dsh's evaluate envelope. The body is `{ model, state, questions }`; question ids stay Pi's. */
-async function postEvaluation(key: string, state: unknown, questions: unknown, signal: AbortSignal): Promise<JevEvaluation> {
+async function postEvaluation(key: string, state: unknown, questions: unknown, signal: AbortSignal, record?: RequestRecord): Promise<JevEvaluation> {
 	let response: Response;
 	try {
-		response = await fetch(EVALUATE_URL, {
-			method: "POST",
-			headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
-			body: JSON.stringify(evaluationBody(state, questions)),
-			signal,
+		response = await sendJevRequest({
+			body: serializeJevRequest(state, questions),
+			apiKey: key, signal, record,
 		});
 	} catch (error) {
 		if (signal.aborted) throw signal.reason ?? error;
@@ -391,12 +384,21 @@ async function postEvaluation(key: string, state: unknown, questions: unknown, s
 }
 
 async function askJev(ctx: ExtensionContext, parent: AbortSignal, timeoutMs: number, state: unknown, questions: unknown, onAttempt: () => void, accept: (body: JevEvaluation) => JevEvaluation = (body) => body, onFailure?: () => void, keyBox: { current?: string } = {}): Promise<JevEvaluation> {
+	// Capture ownership before credential lookup/retries can yield to another session.
+	const sessionId = ctx.sessionManager.getSessionId();
+	const warn = (message: string) => {
+		try { ctx.ui.notify(message, "warning"); } catch { /* Observation cannot interrupt generation. */ }
+	};
+	const record: RequestRecord | undefined = isSafeSessionId(sessionId)
+		? { directory: join(getAgentDir(), "jev-router", "requests"), sessionId, fileName: `${sessionId}.jsonl`, warn }
+		: undefined;
+	if (!record) warn("Jev request log skipped: invalid session ID.");
 	return withJevAttempts(parent, timeoutMs, async (attemptSignal, started) => {
 		const key = keyBox.current ??= await gatewayKey(ctx, attemptSignal);
 		started();
 		onAttempt();
 		try {
-			const body = await abortable(() => postEvaluation(key, state, questions, attemptSignal), attemptSignal);
+			const body = await abortable(() => postEvaluation(key, state, questions, attemptSignal, record), attemptSignal);
 			return accept(body);
 		} catch (error) {
 			onFailure?.();

@@ -17,7 +17,7 @@
 pi install <本仓库目录>
 ```
 
-`~/.pi/agent/settings.json` 的 `packages` 里会出现指向该目录的一项。Pi 直接加载仓库里的 `index.ts`，不必先打成 npm 包。
+`~/.pi/agent/settings.json` 的 `packages` 里会出现指向该目录的一项。Pi 直接加载仓库里的 `index.ts`，以及同级 `../jev-router-policy/src/index.ts`（强度策略）和 `../jev-router-policy/src/client.ts`（Jev 请求序列化、发送与记录），没有构建步骤，不必先打成 npm 包。修改这些源码后要由用户执行 `/reload` 才会重新加载；已经加载的运行实例不会自动更新。
 
 如果以前装过 `npm:pi-jev-router`，先卸掉再装本地目录，避免两份路由同时生效：
 
@@ -174,6 +174,12 @@ Thinking 选 medium、high、xhigh 或 max 时，就是固定那一档，不会�
 成功的 Choice 评估会把选项概率写进私有账本 `<Pi agent 目录>/jev-router/sessions/<session-id>.jsonl`。`node scripts/inspect.mjs show <session-id|latest>` 的 `probabilityDecisions` 列出每次最终评估的分布、最高项、次高项和差值；并列时差值为 0。旧版本分块路由留下的中间评估在 `intermediateProbabilities`，当前选模型不再产生这些记录，也不和最终决策混在一起算。
 
 推理强度的键是档位名。首次选模型和换模型建议的键是「模型 @ 强度」；当前模型会带 `keep`。不要把这些数读成单独的模型概率。概率只说明选项拉开了多少，不代表任务成功，也不会自动换模型或升降档。没有概率记为缺失，校验不通过记为无效；这项字段出现之前的旧记录也视为缺失。两种情况都不改变当时的选择。只有一个候选项因而没发请求时，不会编造概率。账本仍然不记录正文、凭证或原始响应。
+
+## 请求正文记录与隐私
+
+每次真正发往 Jev 的 HTTP 请求都会异步记录到 `<Pi agent 目录>/jev-router/requests/<session-id>.jsonl`；首次选模型、监控、自适应强度、具体模型的 low 开关、技能匹配和每次重试都覆盖。遵守 `PI_CODING_AGENT_DIR`。每行只有 `time`、所属 `sessionId` 和 `body`，其中 `body` 是 fetch 实际发送的完整 JSON 字符串，`model`、`state`、`questions` 的字段顺序和字节不变。
+
+**正文不脱敏，可能包含对话中的秘密、工具结果摘录以及技能名称和描述。** 不额外记录 Authorization 等请求头、API 密钥、响应正文或主模型的完整输入；正文原本带有的密钥不会被清除。目录权限为 `0700`，普通文件为 `0600`。不安全的会话 ID 会警告并跳过记录，不改变网络请求；没有 HTTP 请求就没有记录。记录是异步、尽力而为的：生成不等待磁盘写入，写入失败只警告，进程突然退出可能丢失尚未完成的记录。并发写入可能按不同于发送的顺序完成；`time` 是计划发送时的时间。只读统计脚本仍然只读 `sessions/` 的元数据，不读取这个 `requests/` 目录。
 
 ## 限制
 

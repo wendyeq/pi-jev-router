@@ -33,13 +33,18 @@ export type JevStat = {
 	applyStatus?: "applied" | "not-applied" | "apply-failed" | "cancelled";
 };
 
+/** Shared by the metadata ledger and raw-request file naming. */
+export function isSafeSessionId(sessionId: string): boolean {
+	return /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$/.test(sessionId);
+}
+
 /** Separate from Pi's conversation JSONL: session files can be created with a permissive umask. */
 export function appendStat(agentDir: string, sessionId: string, entry: JevStat): boolean {
 	try {
 		const dir = join(agentDir, "jev-router", "sessions");
 		mkdirSync(dir, { recursive: true, mode: 0o700 });
 		chmodSync(dir, 0o700);
-		if (!/^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$/.test(sessionId)) return false;
+		if (!isSafeSessionId(sessionId)) return false;
 		const path = join(dir, `${sessionId}.jsonl`);
 		const fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND | (constants.O_NOFOLLOW ?? 0), 0o600);
 		try {

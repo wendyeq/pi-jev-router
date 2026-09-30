@@ -30,9 +30,5 @@
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.85.1"
-  },
-  "dependencies": {
-    "ai": "7.0.105",
-    "zod": "4.6.5"
   }
 }

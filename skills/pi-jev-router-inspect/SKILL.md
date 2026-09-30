@@ -19,7 +19,7 @@ node scripts/inspect.mjs show <session-id|latest>
 
 ## 选项概率
 
-`show` 才包含概率。`probabilityDecisions` 是成功评估的最终选择，含推理强度评估。`intermediateProbabilities` 只是分块路由的中间评估；不要并进最终决策，也不要把两边的差值加总或平均。`sessions` 列表不含这些分布。
+`show` 才包含概率。`probabilityDecisions` 是成功评估的最终选择，含推理强度评估。`intermediateProbabilities` 是旧版本分块路由留下的中间评估；当前选模型不再产生这些记录。不要并进最终决策，也不要把两边的差值加总或平均。`sessions` 列表不含这些分布。
 
 每条报告 `question`、`option`、`status`、`top`、`runnerUp`、`margin`。`status` 为 `available` 时同时给出分布。差值为 0 表示并列最高。`missing` 是没有返回概率，或这条记录早于概率字段。`invalid` 是概率未通过校验，不要补造分布。`skipped-single` 和 fallback 不在这两个列表里。
 

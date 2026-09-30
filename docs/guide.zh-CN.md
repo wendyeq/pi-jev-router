@@ -78,7 +78,7 @@ pi list
 
 档位名称是 `off`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`。模型自己不支持的档不会出现。这三个 GPT-6 的 `minimal` 通常不可用；`off` 是否可用看模型映射。
 
-`timeoutMs` 是单次 Jev 评估的超时，范围 1 到 60000 毫秒。`monitor` 为 true 时，新的用户消息可能提示换模型，但不会自动换。`skills` 默认关闭。
+`timeoutMs` 是单次尝试的超时，范围 1 到 60000 毫秒。`monitor` 为 true 时，新的用户消息可能提示换模型，但不会自动换。`skills` 默认关闭。
 
 `minThinking` 可以写在全局或某个模型上，用来抬高最低档。这三个 GPT-6 如果写了自己的 `minThinking`，以该项为准，可以低于全局最低档。不写则跟随全局。低于最低档的选项不会交给 Jev。
 
@@ -94,7 +94,7 @@ pi list
 
 压缩会话这类辅助请求不重新判断，只沿用当前档。同一段上下文的重试也不会再评一次。
 
-Jev 返回 HTTP 503 时会立即重试一次；仍失败才使用 `fallback`。当前配置会钉到 sol，并给出警告。会话已经钉住之后再失败，不会改去后备模型，而是保持原模型。503 重试也适用于自适应强度、具体模型的 low 开关和技能匹配；再次失败时分别保持当前强度、沿用该模型上次成功且仍不低于最低档的强度（无可用记录则用该模型最低档，未设置时为 low），或跳过本次技能匹配。
+一次 Jev 提问最多 3 次尝试，每次单独受 `timeoutMs` 限制，相邻两次之间等 1 秒。会重试的是 HTTP 408、429、500、502、503、504、网络错误，以及请求已经发出之后的超时。查凭证时还没发出请求就超时、其他 4xx、无效答案、缺少密钥，以及调用方取消，都不重试。三次都失败才使用 `fallback`。当前配置会钉到 sol，并给出警告。会话已经钉住之后再失败，不会改去后备模型，而是保持原模型。同一套重试也适用于自适应强度、具体模型的 low 开关和技能匹配；仍失败时分别保持当前强度、沿用该模型上次成功且仍不低于最低档的强度（无可用记录则用该模型最低档，未设置时为 low），或跳过本次技能匹配。选模型只发一次请求：先丢掉更旧的整条消息，仍放不下就只保留最新用户消息的开头和结尾。正文加上题目仍超过 28000 字节时不发请求，直接用 fallback。
 
 `monitor` 打开时，Jev 可能建议 fork 到另一个模型，每个备选在本会话只提示一次。当前会话保持原模型。若要换，用 `/fork`，再在新会话里选模型和 Thinking。直接在原会话里改成具体模型会离开这条自动路由。
 
@@ -112,7 +112,7 @@ Pi 的 Thinking 菜单不能增加「auto」这一项。菜单上的 **low** 在
 
 判断时还会把本会话中同一模型上次实际用过的档位一并告诉 Jev，所以它可以选择保持升上去的档，而不是每次请求都从头重判。
 
-Jev 超时、缺少 Gateway 密钥或返回无效档时，优先沿用本会话中同一模型上次成功判断、且仍不低于 `minThinking` 的强度（重新加载后也有效）；没有可用记录，或这次请求无法写入更新时，按该模型最低档发出。没设最低档时，最低档就是原来的 low。
+三次尝试都超时，或缺少 Gateway 密钥，或返回无效档时，优先沿用本会话中同一模型上次成功判断、且仍不低于 `minThinking` 的强度（重新加载后也有效）；没有可用记录，或这次请求无法写入更新时，按该模型最低档发出。没设最低档时，最低档就是原来的 low。
 
 Thinking 选 medium、high、xhigh 或 max 时，就是固定那一档，不会再问 Jev。
 
@@ -143,7 +143,7 @@ Thinking 选 medium、high、xhigh 或 max 时，就是固定那一档，不会�
 | `low-switch kept low` | 问过，判断 low 就够。 |
 | `low-switch failed` | 检查失败，优先沿用同模型上次成功且仍不低于最低档的强度；没有可用记录时按最低档发出。没设最低档时按 low 发出。 |
 
-失败原因只有这几个词：`budget`、`missing-key`、`invalid-choice`、`payload`、`timeout`、`unavailable`。接口返回的原文不会写进记录。
+失败原因只有这几个词：`budget`、`missing-key`、`invalid-choice`、`invalid-answer`、`payload`、`timeout`、`unavailable`。接口返回的原文不会写进记录。
 
 另外还有行为用的记录：`jev-route`、`jev-pin`、`jev-effort`、`jev-monitor`、`jev-suggestion`。Pi 自己的 `model_change` 和 `thinking_level_change` 只表示菜单上选了什么，不是 Jev 的判断。
 
@@ -171,7 +171,7 @@ Thinking 选 medium、high、xhigh 或 max 时，就是固定那一档，不会�
 
 统计脚本和配套 skill 的正本都在 `skills/pi-jev-router-inspect`。`node scripts/inspect.mjs` 只是转调用它。把这个目录链接到 agent 的 skills 目录后，改仓库即改 skill。
 
-成功的 Choice 评估会把选项概率写进私有账本 `<Pi agent 目录>/jev-router/sessions/<session-id>.jsonl`。`node scripts/inspect.mjs show <session-id|latest>` 的 `probabilityDecisions` 列出每次最终评估的分布、最高项、次高项和差值；并列时差值为 0。分块路由的中间评估在 `intermediateProbabilities`，不和最终决策混在一起算。
+成功的 Choice 评估会把选项概率写进私有账本 `<Pi agent 目录>/jev-router/sessions/<session-id>.jsonl`。`node scripts/inspect.mjs show <session-id|latest>` 的 `probabilityDecisions` 列出每次最终评估的分布、最高项、次高项和差值；并列时差值为 0。旧版本分块路由留下的中间评估在 `intermediateProbabilities`，当前选模型不再产生这些记录，也不和最终决策混在一起算。
 
 推理强度的键是档位名。首次选模型和换模型建议的键是「模型 @ 强度」；当前模型会带 `keep`。不要把这些数读成单独的模型概率。概率只说明选项拉开了多少，不代表任务成功，也不会自动换模型或升降档。没有概率记为缺失，校验不通过记为无效；这项字段出现之前的旧记录也视为缺失。两种情况都不改变当时的选择。只有一个候选项因而没发请求时，不会编造概率。账本仍然不记录正文、凭证或原始响应。
 

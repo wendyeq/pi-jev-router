@@ -52,14 +52,14 @@ export function appendStat(agentDir: string, sessionId: string, entry: JevStat):
 
 export function usageFields(result: unknown): Pick<JevStat, "inputTokens" | "outputTokens" | "gatewayCostUsd"> {
 	if (!result || typeof result !== "object") return {};
-	const value = result as { usage?: { inputTokens?: unknown; outputTokens?: unknown }; providerMetadata?: unknown; cost?: unknown };
+	const value = result as { usage?: { inputTokens?: unknown; outputTokens?: unknown }; providerMetadata?: unknown };
 	const tokens = (n: unknown) => typeof n === "number" && Number.isSafeInteger(n) && n >= 0 ? n : undefined;
 	const cost = (n: unknown) => typeof n === "number" && Number.isFinite(n) && n >= 0 ? n : typeof n === "string" && n.trim() !== "" && Number.isFinite(Number(n)) && Number(n) >= 0 ? Number(n) : undefined;
-	// The AI SDK's Gateway evaluation result may expose cost either directly or in provider metadata.
+	// POST /v1/evaluate reports cost only in providerMetadata.gateway.cost.
 	const metadata = value.providerMetadata as { gateway?: { cost?: unknown } } | undefined;
 	const inputTokens = tokens(value.usage?.inputTokens);
 	const outputTokens = tokens(value.usage?.outputTokens);
-	const gatewayCostUsd = cost(metadata?.gateway?.cost ?? value.cost);
+	const gatewayCostUsd = cost(metadata?.gateway?.cost);
 	return { ...(inputTokens !== undefined ? { inputTokens } : {}),
 		...(outputTokens !== undefined ? { outputTokens } : {}),
 		...(gatewayCostUsd !== undefined ? { gatewayCostUsd } : {}) };

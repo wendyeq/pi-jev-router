@@ -21,6 +21,16 @@ export type JevStat = {
 	inputTokens?: number;
 	outputTokens?: number;
 	gatewayCostUsd?: number;
+	/** Shared effort policy. Absent on older logs and on model routing. */
+	policyVersion?: string;
+	rawConfidence?: number | null;
+	confidenceStatus?: "available" | "missing" | "invalid";
+	selectedEffort?: string;
+	decisionReason?: string;
+	effectiveEffort?: string;
+	/** Request-level effort field. It can differ from the effort a configuration update puts in force. */
+	requestEffort?: string;
+	applyStatus?: "applied" | "not-applied" | "apply-failed" | "cancelled";
 };
 
 /** Separate from Pi's conversation JSONL: session files can be created with a permissive umask. */

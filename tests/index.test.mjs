@@ -462,8 +462,9 @@ test("adaptive Astra effort changes on tool continuations, preserving the initia
 	assert.deepEqual(high.input.slice(0, initial.input.length), initial.input);
 	assert.deepEqual(high.input.at(-1), { type: "configuration_update", reasoning: { effort: "high" } });
 	assert.deepEqual(Object.keys(requests[1].questions.effort.criteria), ["medium", "high", "xhigh", "max"]);
-	assert.equal(requests[1].state.recent.at(-1).isError, true);
-	assert.equal(requests[1].state.recent.at(-1).text, "Unresolved failure");
+	assert.equal(requests[1].state.messages.at(-1).role, "tool");
+	assert.equal(requests[1].state.messages.at(-1).text, "Unresolved failure");
+	assert.equal(Object.hasOwn(requests[1].state.messages.at(-1), "isError"), false);
 	const historicalAuxiliary = await harness({ refs: [DEEP], responsesPayload: true, history: h.entries });
 	await historicalAuxiliary.stream(context("Fix the failure"), { sessionId: "compaction" }).result();
 	assert.equal(historicalAuxiliary.calls[0].payload.input.at(-1).reasoning.effort, "high", "auxiliary calls use current effort, even when their context matches an earlier decision");
@@ -545,6 +546,11 @@ test("adaptive effort failure and invalid choices retain current effort without 
 	controller.abort();
 	await h.stream(context("Cancelled", 3), { signal: controller.signal }).result();
 	assert.equal(h.calls.length, 1);
+	const raisedFloor = await harness({ refs: [DEEP], responsesPayload: true, history: [{ name: "jev-pin", data: { target: DEEP, thinking: "low", sessionId: "main" } }], gatewayKey: false });
+	await raisedFloor.stream().result();
+	assert.equal(raisedFloor.calls[0].payload.reasoning.effort, "low", "the request field stays at the pinned initial effort");
+	assert.equal(raisedFloor.calls[0].payload.input.at(-1).reasoning.effort, "medium", "a below-floor previous effort is not reused after Jev fails");
+	assert.equal(raisedFloor.entries.filter((entry) => entry.name === "jev-trace").at(-1).data.thinking, "medium");
 });
 
 test("adaptive effort cancellation saves no decision and timeout keeps the existing effort", async (t) => {
@@ -661,7 +667,7 @@ test("concrete GPT-6 low thinking asks Jev and keeps low when the check fails", 
 	h.ctx.signal = AbortSignal.abort();
 	const before = h.notices.length;
 	const traced = traces().length;
-	assert.equal(await ask(astra, "low"), undefined);
+	await assert.rejects(ask(astra, "low"));
 	assert.equal(h.notices.length, before);
 	assert.equal(traces().length, traced);
 });
@@ -669,7 +675,7 @@ test("concrete GPT-6 low thinking asks Jev and keeps low when the check fails", 
 test("luna and sol low switch starts at medium, including when the check fails", async (t) => {
 	t.after(() => rmSync(settingsPath, { force: true }));
 	const LUNA = "openai/gpt-6-luna";
-	const SOL = "openai/gpt-6-sol";
+	const SOL = "openai/gpt-6.1-sol";
 	writeFileSync(settingsPath, JSON.stringify({ jevRouter: { options: {
 		[LUNA]: { description: "Luna", thinking: "auto", minThinking: "medium" },
 		[SOL]: { description: "Sol", thinking: "auto", minThinking: "medium" },
@@ -682,7 +688,7 @@ test("luna and sol low switch starts at medium, including when the check fails",
 	});
 	const h = await harness({ refs: [LUNA, SOL, DEEP] });
 	const luna = h.models.find((model) => model.id === "gpt-6-luna");
-	const sol = h.models.find((model) => model.id === "gpt-6-sol");
+	const sol = h.models.find((model) => model.id === "gpt-6.1-sol");
 	const astra = h.models.find((model) => model.id === "gpt-6-astra");
 	const payload = { input: [{ role: "user", content: "Fix the failure" }], reasoning: { effort: "low", summary: "auto" }, prompt_cache_key: "session" };
 	const ask = async (model) => {
@@ -696,7 +702,8 @@ test("luna and sol low switch starts at medium, including when the check fails",
 	assert.equal(raised.reasoning.effort, "low");
 	assert.deepEqual(raised.input.at(-1), { type: "configuration_update", reasoning: { effort: "high" } });
 	assert.deepEqual(Object.keys(requests.at(-1).questions.effort.criteria), ["medium", "high", "xhigh", "max"]);
-	assert.match(requests.at(-1).questions.effort.instructions, /Use medium for routine/);
+	assert.match(requests.at(-1).questions.effort.instructions, /The previous effort is only a fact/);
+	assert.doesNotMatch(requests.at(-1).questions.effort.instructions, /Keep current effort unless there is a clear reason/);
 	mode = "medium";
 	assert.deepEqual((await ask(sol)).input.at(-1), { type: "configuration_update", reasoning: { effort: "medium" } });
 	assert.deepEqual(traces().at(-1).data, { sessionId: "main", kind: "low-switch", outcome: "applied", target: SOL, thinking: "medium" });
@@ -713,7 +720,7 @@ test("luna and sol low switch starts at medium, including when the check fails",
 	assert.match(h.notices.at(-1)[0], /Keeping last effort high/);
 	mode = "low";
 	assert.equal(await ask(astra), undefined);
-	assert.match(requests.at(-1).questions.effort.instructions, /Use low for routine/);
+	assert.match(requests.at(-1).questions.effort.instructions, /The previous effort is only a fact/);
 	assert.equal(traces().at(-1).data.thinking, "low");
 });
 
@@ -735,20 +742,21 @@ test("low switch tells Jev the effort this session last applied", async (t) => {
 		return h.handlers.get("before_provider_request")({ payload }, h.ctx);
 	};
 	assert.equal(await ask(), undefined);
-	assert.equal(requests.at(-1).state.currentThinking, "low", "without a prior decision the current effort is the menu level");
-	assert.match(requests.at(-1).questions.effort.instructions, /Keep current effort unless there is a clear reason to change/);
+	assert.equal(requests.at(-1).state.currentEffort, null, "without a prior decision there is no applied effort");
+	assert.match(requests.at(-1).questions.effort.instructions, /The previous effort is only a fact/);
+	assert.doesNotMatch(requests.at(-1).questions.effort.instructions, /Keep current effort unless there is a clear reason/);
 	mode = "high";
 	assert.deepEqual((await ask()).input.at(-1), { type: "configuration_update", reasoning: { effort: "high" } });
-	assert.equal(requests.at(-1).state.currentThinking, "low", "the reported effort predates this request's own decision");
+	assert.equal(requests.at(-1).state.currentEffort, "low", "the reported effort predates this request's own decision");
 	mode = "low";
 	assert.equal(await ask(), undefined, "a raised effort can still come back down");
-	assert.equal(requests.at(-1).state.currentThinking, "high", "the raised effort becomes the current effort");
+	assert.equal(requests.at(-1).state.currentEffort, "high", "the raised effort becomes the current effort");
 	const other = await harness({ history: h.entries, sessionId: "other" });
 	other.ctx.model = other.models.find((model) => model.id === "gpt-6-astra");
 	other.ctx.thinkingLevel = "low";
 	await other.handlers.get("context")({ messages: context("New session").messages }, other.ctx);
 	await other.handlers.get("before_provider_request")({ payload }, other.ctx);
-	assert.equal(requests.at(-1).state.currentThinking, "low", "another session cannot inherit the previous effort");
+	assert.equal(requests.at(-1).state.currentEffort, null, "another session cannot inherit the previous effort");
 });
 
 test("effort payload preserves headers/settings, rejects incompatible modes, and maps provider effort names", () => {
@@ -773,7 +781,7 @@ test("effort payload preserves headers/settings, rejects incompatible modes, and
 	}
 	const LUNA6 = "gpt-load/gpt-6-luna";
 	assert.doesNotThrow(() => parseConfig({ options: { [LUNA6]: { description: "Cheap GPT-6", thinking: "auto", adaptiveThinking: true }, [DEEP]: { description: "Deep", thinking: "auto" } }, fallback: DEEP }));
-	assert.doesNotThrow(() => parseConfig({ options: { ["openai-codex/gpt-6-sol"]: { description: "Sol", thinking: "auto", adaptiveThinking: true } }, fallback: "openai-codex/gpt-6-sol" }));
+	assert.doesNotThrow(() => parseConfig({ options: { ["openai-codex/gpt-6.1-sol"]: { description: "Sol", thinking: "auto", adaptiveThinking: true } }, fallback: "openai-codex/gpt-6.1-sol" }));
 });
 
 test("structured three-model criteria survive routing and monitoring", async (t) => {
@@ -1578,6 +1586,7 @@ test("concrete effort records actual selected and degraded strengths without inf
 	const run = () => h.handlers.get("before_provider_request")({ payload }, h.ctx);
 	assert.equal((await run()).input.at(-1).reasoning.effort, "high");
 	mode = "error";
+	await h.handlers.get("context")({ messages: context("PRIVATE TEXT NEXT").messages }, h.ctx);
 	assert.equal((await run()).input.at(-1).reasoning.effort, "high");
 	const evals = ledger(id).filter((r) => r.kind === "evaluation");
 	assert.deepEqual(evals.map(({ outcome, attempts }) => [outcome, attempts]), [["selected", 1], ["temporary-failure", 2]]);
@@ -1769,6 +1778,9 @@ test("adaptive effort and the low switch record effort probabilities without cha
 	await low.handlers.get("context")({ messages: context("PRIVATE LOW").messages }, low.ctx);
 	const run = () => low.handlers.get("before_provider_request")({ payload: { input: [], reasoning: { effort: "low" } } }, low.ctx);
 	assert.equal((await run()).input.at(-1).reasoning.effort, "high");
+	const beforeReuse = requests.length;
+	assert.equal((await run()).input.at(-1).reasoning.effort, "high", "the same context does not evaluate or raise again");
+	assert.equal(requests.length, beforeReuse);
 	const lowEval = ledger(lowId).find((record) => record.kind === "evaluation");
 	assert.equal(lowEval.question, "effort");
 	assert.equal(lowEval.choice, "high");
@@ -1777,6 +1789,7 @@ test("adaptive effort and the low switch record effort probabilities without cha
 	assert.equal(Object.hasOwn(lowEval.probabilities, DEEP), false);
 	mode = "invalid";
 	desired = "xhigh";
+	await low.handlers.get("context")({ messages: context("PRIVATE LOW NEXT").messages }, low.ctx);
 	const before = requests.length;
 	assert.equal((await run()).input.at(-1).reasoning.effort, "xhigh");
 	assert.equal(requests.length, before + 1);
@@ -1844,4 +1857,38 @@ test("skill selection still uses boolean probabilities and does not store a choi
 	assert.equal(item.probabilityStatus, undefined);
 	assert.equal(item.probabilities, undefined);
 	assert.ok(!readFileSync(ledgerPath("stat-skill-prob"), "utf8").includes("PRIVATE BODY"));
+});
+
+test("unified effort reads the answer confidence and does not substitute the top probability", async (t) => {
+	t.after(() => rmSync(settingsPath, { force: true }));
+	writeFileSync(settingsPath, JSON.stringify({ jevRouter: { options: {
+		[DEEP]: { description: "Deep", thinking: { low: "L", medium: "M", high: "H" } },
+	}, fallback: DEEP } }));
+	const fixture = (name) => JSON.parse(readFileSync(new URL(`../../jev-router-policy/fixtures/${name}`, import.meta.url))).body;
+	let body = fixture("pi-success.json");
+	mockGateway(t, () => Response.json(body));
+	const id = "confidence-proof";
+	const h = await harness({ refs: [DEEP], sessionId: id });
+	h.ctx.model = h.models[0];
+	h.ctx.thinkingLevel = "low";
+	const payload = { input: [], reasoning: { effort: "low" } };
+	const ask = async (text) => {
+		await h.handlers.get("context")({ messages: context(text).messages }, h.ctx);
+		return h.handlers.get("before_provider_request")({ payload }, h.ctx);
+	};
+	assert.equal((await ask("success")).input.at(-1).reasoning.effort, "high");
+	const success = ledger(id).find((record) => record.kind === "evaluation");
+	assert.equal(success.rawConfidence, 0.42);
+	assert.notEqual(success.rawConfidence, 0.7);
+	assert.equal(success.selectedEffort, "high");
+	assert.equal(success.decisionReason, "capped");
+	assert.equal(success.policyVersion, "2026-09-30.2");
+	body = fixture("pi-recovery.json");
+	assert.equal((await ask("recovery")).input.at(-1).reasoning.effort, "high");
+	const recovered = ledger(id).filter((record) => record.kind === "evaluation").at(-1);
+	assert.equal(recovered.rawConfidence, 0.3);
+	assert.notEqual(recovered.rawConfidence, 0.7);
+	assert.equal(recovered.confidenceStatus, "available");
+	assert.equal(recovered.selectedEffort, "high");
+	assert.equal(recovered.decisionReason, "capped");
 });

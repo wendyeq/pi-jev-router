@@ -5,7 +5,7 @@
 | 用法 | 你选什么 | 推理强度 |
 | --- | --- | --- |
 | 自动选模型 | `auto / jev` | 钉住后，该路由打开了 `adaptiveThinking` 才会在后续请求里升降。 |
-| 指定模型 | `gpt-6-luna`、`gpt-6-sol` 或 `gpt-6-astra`，Thinking 选 **low** | 每次请求前问 Jev。不需要 `adaptiveThinking`。菜单上仍显示 low。 |
+| 指定模型 | `gpt-6-luna`、`gpt-6.1-sol` 或 `gpt-6-astra`，Thinking 选 **low** | 每次请求前问 Jev。不需要 `adaptiveThinking`。菜单上仍显示 low。 |
 
 需要 Pi、Node.js 22.19 或更高，以及 Vercel AI Gateway 的密钥。生成请求走所选模型在 Pi 里已经配置的 provider 和密钥，不经过 Jev。
 
@@ -46,7 +46,7 @@ pi list
         "thinking": "auto",
         "adaptiveThinking": true
       },
-      "openai/gpt-6-sol": {
+      "openai/gpt-6.1-sol": {
         "description": "复杂编码和 agent 工作流的默认模型。调查、多文件实现、普通到困难的调试、仓库内的正确性检查，以及在现有系统里把功能做完，都选它。不用于 luna 就能做完的例行执行，也不用于跨系统的架构定案、安全关键的最终判断，或失败模式互相牵连、读改这个仓库收不了尾的端到端难题。任务难、含糊或像在要建议，仍先选它，除非上一句明确排除。",
         "thinking": "auto",
         "adaptiveThinking": true
@@ -57,7 +57,7 @@ pi list
         "adaptiveThinking": true
       }
     },
-    "fallback": "openai/gpt-6-sol",
+    "fallback": "openai/gpt-6.1-sol",
     "timeoutMs": 5000,
     "monitor": true,
     "skills": false
@@ -90,7 +90,7 @@ pi list
 
 第一条用户消息按三条 `description` 钉住一个模型，并选定初始推理强度。之后这个会话不再换模型。该路由打开了 `adaptiveThinking` 时，主会话里的后续请求，包括工具返回后的下一步，会再问 Jev 要不要升降推理强度。没打开就停在初始档。一次回复正在输出时不会改档。
 
-状态栏类似 `auto: openai/gpt-6-sol (high, adaptive)`。`adaptive` 表示还会继续升降；`pinned` 表示停在初始档。
+状态栏类似 `auto: openai/gpt-6.1-sol (high, adaptive)`。`adaptive` 表示还会继续升降；`pinned` 表示停在初始档。
 
 压缩会话这类辅助请求不重新判断，只沿用当前档。同一段上下文的重试也不会再评一次。
 
@@ -102,7 +102,7 @@ Jev 返回 HTTP 503 时会立即重试一次；仍失败才使用 `fallback`。�
 
 Pi 的 Thinking 菜单不能增加「auto」这一项。菜单上的 **low** 在这三个模型 id 上被用作开关，显示名字仍然是 low。provider 前缀不限。这个开关不读取 `adaptiveThinking`。
 
-1. 模型选 `openai/gpt-6-luna`、`openai/gpt-6-sol` 或 `openai/gpt-6-astra`，不要选 auto / jev。
+1. 模型选 `openai/gpt-6-luna`、`openai/gpt-6.1-sol` 或 `openai/gpt-6-astra`，不要选 auto / jev。
 2. Thinking 选 **low**。
 3. 发送任务。
 
@@ -157,7 +157,7 @@ Thinking 选 medium、high、xhigh 或 max 时，就是固定那一档，不会�
 这是一个困难的正确性与安全问题，不要使用工具。系统同时满足这些互相约束的条件：跨两个可用区的账本，写入需多数派确认；时钟会跳变最多 5 秒；幂等键只在单节点内存里保存 30 秒；故障切换时旧主可能继续提交；审计日志允许乱序但监管要求最终能证明没有双花。请给出一个不会双花、也不会在时钟跳变和脑裂同时发生时丢单的提交协议，并指出至少两个你拒绝的方案以及它们失败的具体交错。
 ```
 
-期望 `Last trace` 类似 `low-switch applied xhigh openai/gpt-6-sol`。`high`、`xhigh`、`max` 都算升档。
+期望 `Last trace` 类似 `low-switch applied xhigh openai/gpt-6.1-sol`。`high`、`xhigh`、`max` 都算升档。
 
 对照用简单题：
 
@@ -178,7 +178,7 @@ Thinking 选 medium、high、xhigh 或 max 时，就是固定那一档，不会�
 ## 限制
 
 - Thinking 菜单不能改名，也不能增加 auto。low 在三个 GPT-6 上是开关，在 auto / jev 里是真实低档。
-- 自适应只覆盖模型 id 为 `gpt-6-astra`、`gpt-6-luna`、`gpt-6-sol` 的请求，provider 前缀不限。其它模型即使写了 `adaptiveThinking` 也会在加载配置时报错。
+- 自适应只覆盖模型 id 为 `gpt-6-astra`、`gpt-6-luna`、`gpt-6.1-sol` 的请求，provider 前缀不限。其它模型即使写了 `adaptiveThinking` 也会在加载配置时报错。
 - 中途改档依赖 Responses 的 `configuration_update`。不要同时打开服务商侧的自动压缩或自动截断，也不要让别的钩子插入 `configuration_update`。
 - 评估把消息当任务证据。提示词里写「使用 astra」不会强制换模型。
 - 发往 Jev 的摘录不脱敏。工具结果里的密钥也会被送去评估。
